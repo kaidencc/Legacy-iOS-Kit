@@ -711,7 +711,7 @@ version_update_check() {
         /usr/bin/xattr -cr ../bin/macos
     fi
     log "Checking for updates..."
-    download_from_url "https://api.github.com/repos/LukeZGD/Legacy-iOS-Kit/releases/latest" latest
+    download_from_url "https://api.github.com/repos/kaidencc/Legacy-iOS-Kit/releases/latest" latest
     github_api=$(cat latest 2>/dev/null)
     version_latest=$(echo "$github_api" | $jq -r '.name')
     version_latest=${version_latest#Latest-}
