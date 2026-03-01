@@ -4259,14 +4259,14 @@ ipsw_prepare_ios4multipart() {
     rm -f $all_flash2/DeviceTree.${device_model}ap.img3
     file_extract_from_archive "$ipsw_path.ipsw" $all_flash/DeviceTree.${device_model}ap.img3 $all_flash2
 
-    local ExtraArr=("--boot-partition" "--boot-ramdisk" "--logo4")
+    local ExtraArr=("--boot-partition" "--boot-ramdisk" "--logo4" "--debug")
     case $device_target_vers in
         4.2.9 | 4.2.10 ) :;;
         * ) ExtraArr+=("--433");;
     esac
     local bootargs="$device_bootargs_default"
     if [[ $ipsw_verbose == 1 ]]; then
-        bootargs="pio-error=0 -v"
+        bootargs="pio-error=0 -v amfi=0xff cs_enforcement_disable=1"
     fi
     ExtraArr+=("-b" "$bootargs")
     patch_iboot "${ExtraArr[@]}"
