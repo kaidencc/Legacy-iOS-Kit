@@ -5078,10 +5078,10 @@ ipsw_prepare_powder() {
         gzip -d freeze.tar.gz
     fi
 
-    local ExtraArr=("--boot-partition" "--boot-ramdisk")
+    local ExtraArr=("--boot-partition" "--boot-ramdisk" "--debug")
     local bootargs="$device_bootargs_default"
     if [[ $ipsw_verbose == 1 ]]; then
-        bootargs="pio-error=0 -v"
+        bootargs="pio-error=0 -v amfi=0xff cs_enforcement_disable=1"
     fi
     case $device_target_vers in
         [789]* ) :;;
