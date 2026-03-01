@@ -6715,7 +6715,7 @@ device_ramdisk() {
             log "Patch iBEC"
             "$dir/xpwntool" iBEC.dec iBEC.raw
             if [[ $1 == "justboot" ]]; then
-                "$dir/iBoot32Patcher" iBEC.raw iBEC.patched --rsa -b "$device_bootargs"
+                "$dir/iBoot32Patcher" iBEC.raw iBEC.patched --rsa --debug -b "$device_bootargs"
             else
                 "$dir/iBoot32Patcher" iBEC.raw iBEC.patched --rsa --debug -b "rd=md0 -v amfi=0xff amfi_get_out_of_my_way=1 cs_enforcement_disable=1 pio-error=0"
             fi
@@ -10774,7 +10774,7 @@ menu_justboot() {
             print "* Custom Bootargs: $device_bootargs"
         else
             print "* You may enter custom bootargs (optional, experimental option)"
-            print "* Default Bootargs: pio-error=0 -v"
+            print "* Default Bootargs: pio-error=0 -v amfi=0xff cs_enforcement_disable=1"
         fi
         echo
         input "Select an option:"
@@ -10955,7 +10955,7 @@ menu_justboot_history() {
 
 device_justboot() {
     if [[ -z $device_bootargs ]]; then
-        device_bootargs="pio-error=0 -v"
+        device_bootargs="pio-error=0 -v amfi=0xff cs_enforcement_disable=1"
     fi
     if [[ $main_argmode == "device_justboot" ]]; then
         cat "$device_rd_build" > "../saved/$device_type/justboot_${device_ecid}"
