@@ -5,6 +5,7 @@ device_rd_build="" # You can change the version of SSH Ramdisk and Pwned iBSS/iB
 device_bootargs_default="pio-error=0 debug=0x2014e serial=3"
 jelbrek="../resources/jailbreak"
 ssh_port=6414
+use_premade_custom=0
 
 bash_test=$(echo -n 0)
 (( bash_test += 1 ))
@@ -3485,7 +3486,7 @@ ipsw_prepare_config() {
     <key>iBootPatches</key>
     <dict>
         <key>debugEnabled</key>
-        <false/>
+        <true/>
         <key>bootArgsInjection</key>
         <$verbose/>
         <key>bootArgsString</key>
@@ -6094,6 +6095,35 @@ restore_notpwned64() {
 }
 
 ipsw_prepare() {
+    if [[ $use_premade_custom == 1 ]]; then
+        log "Checking for premade custom firmware in 'custom' folder..."
+        if [[ ! -d "../custom" ]]; then
+            error "The 'custom' folder was not found." "Please create a folder named 'custom' in the Legacy-iOS-Kit directory and place your IPSWs there."
+        fi
+
+        # Check Main IPSW
+        if [[ ! -f "$ipsw_custom.ipsw" ]]; then
+            error "Custom IPSW not found!" "Expected: $ipsw_custom.ipsw"
+        fi
+
+        # Check NOR IPSW for old powdersn0w
+        if [[ $device_target_powder == 1 ]] && [[ $device_target_vers == "3"* || $device_target_vers == "4.0"* || $device_target_vers == "4.1"* || $device_target_vers == "4.2"* ]]; then
+            ipsw_custom_part1="${ipsw_custom/_CustomP/_CustomNP}"
+            if [[ ! -f "$ipsw_custom_part1.ipsw" ]]; then
+                error "Custom NOR IPSW (Part 1) not found!" "Expected: $ipsw_custom_part1.ipsw"
+            fi
+            
+            # Check iBoot3 for iPad 1 iOS 3.2
+            if [[ $device_type == "iPad1,1" && $device_target_vers == "3.2"* ]]; then
+                if [[ ! -f "../custom/iBoot3-$device_ecid" ]]; then
+                    error "Custom iBoot3 file not found!" "Expected: ../custom/iBoot3-$device_ecid"
+                fi
+            fi
+        fi
+
+        log "Custom firmware files found. Skipping IPSW creation."
+        return
+    fi
     case $device_proc in
         1 )
             if [[ $ipsw_jailbreak == 1 ]]; then
@@ -7122,7 +7152,11 @@ device_ramdisk_ios3exploit() {
     $scp -P $ssh_port ../resources/firmware/src/target/$device_model/9B206/exploit root@127.0.0.1:/
     $ssh -p $ssh_port root@127.0.0.1 "dd of=/dev/rdisk0s3 if=/exploit bs=64k count=1"
     if [[ $device_type == "iPad1,1" ]]; then
-        $scp -P $ssh_port ../saved/iPad1,1/iBoot3_$device_ecid root@127.0.0.1:/mnt1/iBEC
+        local iboot3_path="../saved/iPad1,1/iBoot3_$device_ecid"
+        if [[ $use_premade_custom == 1 ]]; then
+            iboot3_path="../custom/iBoot3-$device_ecid"
+        fi
+        $scp -P $ssh_port "$iboot3_path" root@127.0.0.1:/mnt1/iBEC
     fi
     if [[ -n $($ssh -p $ssh_port root@127.0.0.1 "ls /mnt1/bin/bash 2>/dev/null") ]]; then
         log "fstab"
@@ -8796,12 +8830,19 @@ menu_ipsw() {
             fi
         fi
 
-        menu_items=("Select Target IPSW")
+        menu_items=("Select Target IPSW (Stock)")
         menu_print_info
-        print "* Only select unmodified IPSW for the selection. Do not select custom IPSWs"
+        if [[ $use_premade_custom == 1 ]]; then
+            warn "Custom Firmware Mode is ON."
+            print "* Please ensure your premade custom IPSW files are located in the 'custom' folder."
+            print "* You must still select the STOCK target/base IPSWs below for version verification."
+            print "* The script will NOT restore the stock IPSW you select here."
+        else
+            print "* Only select unmodified IPSW for the selection. Do not select custom IPSWs"
+        fi
         echo
         if [[ $1 == *"powdersn0w"* ]]; then
-            menu_items+=("Select Base IPSW")
+            menu_items+=("Select Base IPSW (Stock)")
             if [[ $device_proc == 4 ]]; then
                 menu_items+=("Download Base IPSW")
             fi
@@ -8877,7 +8918,7 @@ menu_ipsw() {
             fi
 
         elif [[ $2 == "fourthree" ]]; then
-            menu_items+=("Download Target IPSW" "Select Base IPSW")
+            menu_items+=("Download Target IPSW" "Select Base IPSW (Stock)")
             if [[ -n $ipsw_path ]]; then
                 print "* Selected Target IPSW (iOS 6.1.3): $ipsw_path.ipsw"
                 ipsw_print_warnings
@@ -9014,6 +9055,13 @@ menu_ipsw() {
             menu_items+=("Select Apple Logo" "Select Recovery Logo")
             echo
         fi
+        
+        if [[ ($1 == *"powdersn0w"* || $1 == *"Tethered"*) && $2 != "ipsw" ]]; then
+            local custom_status="OFF"
+            [[ $use_premade_custom == 1 ]] && custom_status="ON"
+            menu_items+=("Custom Firmware [$custom_status]")
+        fi
+
         menu_items+=("Go Back")
 
         if [[ $device_use_bb != 0 && $device_type != "$device_disable_bbupdate" ]] &&
@@ -9048,6 +9096,16 @@ menu_ipsw() {
         case $selected in
             "(*) Create IPSW" ) mode="custom-ipsw";;
             "$start" ) mode="downgrade";;
+            "Custom Firmware"* )
+                if [[ $use_premade_custom == 1 ]]; then
+                    use_premade_custom=0
+                else
+                    use_premade_custom=1
+                    print "* Custom Firmware Mode Enabled."
+                    print "* The script will NOT create an IPSW. It will look for existing files in the 'custom' folder."
+                    print "* You must still select the STOCK IPSW files in the next steps for verification purposes."
+                fi
+            ;;
             "(*) Start Update" )
                 print "* The \"Start Update\" will perform an update to your device without clearing device data."
                 print "* One usage of this is to carry over activation records to the latest iOS version."
@@ -9059,8 +9117,8 @@ menu_ipsw() {
                 fi
                 mode="restore-update"
             ;;
-            "Select Target IPSW" ) menu_ipsw_browse "$1";;
-            "Select Base IPSW" ) menu_ipsw_browse "base";;
+            "Select Target IPSW (Stock)" ) menu_ipsw_browse "$1";;
+            "Select Base IPSW (Stock)" ) menu_ipsw_browse "base";;
             "Select Target SHSH" ) menu_shsh_browse "$1";;
             "Select Base SHSH" ) menu_shsh_browse "base";;
             "Download Target IPSW" ) ipsw_download "../$newpath";;
@@ -9069,7 +9127,7 @@ menu_ipsw() {
             "Select Recovery Logo" ) menu_logo_browse "recovery";;
             "Go Back" )
                 back=1
-
+                use_premade_custom=
                 ipsw_24o=
                 ipsw_cancustomlogo=
                 ipsw_cancustomlogo2=
@@ -9164,7 +9222,7 @@ menu_ipsw_special() {
             7.* ) warn "This is a tethered upgrade and has many broken device features. Not recommended unless you know what you are doing.";;
             6.* ) print "* iOS 6 on touch 3/iPad 1 uses SundanceInH2A by NyanSatan: https://github.com/NyanSatan/SundanceInH2A";;
         esac
-        menu_items=("Select Target IPSW" "Select Base IPSW" "Download Target IPSW" "Download Base IPSW")
+        menu_items=("Select Target IPSW (Stock)" "Select Base IPSW (Stock)" "Download Target IPSW" "Download Base IPSW")
         if [[ -n $ipsw_path && -n $ipsw_base_path ]]; then
             menu_items+=("$start")
         fi
@@ -9177,8 +9235,8 @@ menu_ipsw_special() {
         case $selected in
             "(*) Create IPSW" ) mode="custom-ipsw";;
             "$start" ) mode="downgrade";;
-            "Select Target IPSW" ) menu_ipsw_browse "special";;
-            "Select Base IPSW" ) menu_ipsw_browse "base";;
+            "Select Target IPSW (Stock)" ) menu_ipsw_browse "special";;
+            "Select Base IPSW (Stock)" ) menu_ipsw_browse "base";;
             "Download Target IPSW" ) ipsw_download "../${device_type_special}_${device_target_vers}_${device_target_build}_Restore" special;;
             "Download Base IPSW" ) ipsw_download "../$ipsw_latest_path" latest;;
             "Go Back" )
@@ -9319,6 +9377,9 @@ ipsw_custom_set() {
     if [[ $device_target_powder == 1 && $device_target_vers == "4.3"* ]] || [[ $device_actrec == 1 ]] ||
        [[ $device_type == "$device_disable_bbupdate" && $device_deadbb != 1 ]]; then
         ipsw_custom+="-$device_ecid"
+    fi
+    if [[ $use_premade_custom == 1 ]]; then
+        ipsw_custom="../custom/$(basename "$ipsw_custom")"
     fi
 }
 
