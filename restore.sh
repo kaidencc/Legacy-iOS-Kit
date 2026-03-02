@@ -6108,15 +6108,17 @@ ipsw_prepare() {
 
         # Check NOR IPSW for old powdersn0w
         if [[ $device_target_powder == 1 ]] && [[ $device_target_vers == "3"* || $device_target_vers == "4.0"* || $device_target_vers == "4.1"* || $device_target_vers == "4.2"* ]]; then
-            ipsw_custom_part1="${ipsw_custom/_CustomP/_CustomNP}"
+            # Manually construct the Part 1 filename to ensure it matches the script's creation logic (CustomNP-<ECID>)
+            ipsw_custom_part1="../custom/${device_type}_${device_target_vers}_${device_target_build}_CustomNP-${device_ecid}"
+            
             if [[ ! -f "$ipsw_custom_part1.ipsw" ]]; then
                 error "Custom NOR IPSW (Part 1) not found!" "Expected: $ipsw_custom_part1.ipsw"
             fi
             
             # Check iBoot3 for iPad 1 iOS 3.2
             if [[ $device_type == "iPad1,1" && $device_target_vers == "3.2"* ]]; then
-                if [[ ! -f "../custom/iBoot3-$device_ecid" ]]; then
-                    error "Custom iBoot3 file not found!" "Expected: ../custom/iBoot3-$device_ecid"
+                if [[ ! -f "../custom/iBoot3_$device_ecid" ]]; then
+                    error "Custom iBoot3 file not found!" "Expected: ../custom/iBoot3_$device_ecid"
                 fi
             fi
         fi
@@ -6337,18 +6339,55 @@ menu_remove4() {
     local back
 
     while [[ -z "$mode" && -z "$back" ]]; do
-        menu_items=("Disable Exploit" "Enable Exploit" "Go Back")
+        menu_items=("Disable Exploit" "Enable Exploit")
+        
+        # Add Custom Firmware toggle for iPad 1
+        if [[ $device_type == "iPad1,1" ]]; then
+            local custom_status="OFF"
+            [[ $use_premade_custom == 1 ]] && custom_status="ON"
+            menu_items+=("Custom Firmware [$custom_status]")
+        fi
+        
+        menu_items+=("Go Back")
         menu_print_info
         print " > Main Menu > Useful Utilities > Disable/Enable Exploit"
+        
+        if [[ $use_premade_custom == 1 && $device_type == "iPad1,1" ]]; then
+            print "* Custom Firmware Mode Enabled."
+            print "* Will use iBoot3_$device_ecid from the 'custom' folder."
+        fi
+
         input "Select an option:"
         select_option "${menu_items[@]}"
         selected="${menu_items[$?]}"
+        
+        # Handle Toggle
+        if [[ $selected == "Custom Firmware"* ]]; then
+            if [[ $use_premade_custom == 1 ]]; then
+                use_premade_custom=0
+            else
+                use_premade_custom=1
+            fi
+            continue
+        fi
+
         case $selected in
             "Disable Exploit" ) rec=0;;
             "Enable Exploit" ) rec=2;;
         esac
+        
+        # Check for file if proceeding
+        if [[ $use_premade_custom == 1 && $device_type == "iPad1,1" && ($selected == "Enable Exploit" || $selected == "Disable Exploit") ]]; then
+             if [[ ! -f "../custom/iBoot3_$device_ecid" ]]; then
+                 error "Custom iBoot3 file not found!" "Expected: ../custom/iBoot3_$device_ecid"
+             fi
+        fi
+
         case $selected in
-            "Go Back" ) back=1;;
+            "Go Back" ) 
+                back=1
+                use_premade_custom= # Reset variable when going back
+            ;;
             * ) mode="remove4";;
         esac
     done
@@ -7154,7 +7193,7 @@ device_ramdisk_ios3exploit() {
     if [[ $device_type == "iPad1,1" ]]; then
         local iboot3_path="../saved/iPad1,1/iBoot3_$device_ecid"
         if [[ $use_premade_custom == 1 ]]; then
-            iboot3_path="../custom/iBoot3-$device_ecid"
+            iboot3_path="../custom/iBoot3_$device_ecid"
         fi
         $scp -P $ssh_port "$iboot3_path" root@127.0.0.1:/mnt1/iBEC
     fi
@@ -9056,6 +9095,7 @@ menu_ipsw() {
             echo
         fi
         
+        # Add Custom Firmware toggle here
         if [[ ($1 == *"powdersn0w"* || $1 == *"Tethered"*) && $2 != "ipsw" ]]; then
             local custom_status="OFF"
             [[ $use_premade_custom == 1 ]] && custom_status="ON"
