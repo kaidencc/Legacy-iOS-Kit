@@ -2,7 +2,7 @@
 
 ipsw_openssh=1 # OpenSSH will be added to jailbreak/custom IPSW if set to 1.
 device_rd_build="" # You can change the version of SSH Ramdisk and Pwned iBSS/iBEC here. (default is 10B329 for most devices)
-device_bootargs_default="pio-error=0 debug=0x2014e serial=3"
+device_bootargs_default="pio-error=0 debug=0x2014e serial=3 amfi=0xff cs_enforcement_disable=1"
 jelbrek="../resources/jailbreak"
 ssh_port=6414
 use_premade_custom=0
@@ -2644,6 +2644,12 @@ patch_ibec() {
 }
 
 ipsw_preference_set() {
+    # If using pre-made custom firmware, skip all creation prompts
+    if [[ $use_premade_custom == 1 ]]; then
+        ipsw_custom_set
+        return
+    fi
+
     # sets ipsw variables: ipsw_jailbreak, ipsw_memory, ipsw_verbose
     case $device_latest_vers in
         [76543]* ) ipsw_canjailbreak=1;;
@@ -2720,7 +2726,9 @@ ipsw_preference_set() {
         fi
     fi
 
-    if [[ $ipsw_fourthree == 1 ]]; then
+    if [[ $ipsw_appleinternal == 1 ]]; then
+        ipsw_jailbreak=
+    elif [[ $ipsw_fourthree == 1 ]]; then
         ipsw_jailbreak=1
     elif [[ $ipsw_jailbreak == 1 && $jbpowder != 1 ]]; then
         warn "Jailbreak flag detected, jailbreak option enabled by user."
@@ -3472,10 +3480,6 @@ ipsw_prepare_paths() {
 ipsw_prepare_config() {
     # usage: ipsw_prepare_config [jailbreak (true/false)] [needpref (true/false)]
     # creates config file to FirmwareBundles/config.plist
-    local verbose="false"
-    if [[ $ipsw_verbose == 1 ]]; then
-        verbose="true"
-    fi
     log "Preparing config file"
     echo "<plist>
 <dict>
@@ -3488,7 +3492,7 @@ ipsw_prepare_config() {
         <key>debugEnabled</key>
         <true/>
         <key>bootArgsInjection</key>
-        <$verbose/>
+        <true/>
         <key>bootArgsString</key>
         <string>-v</string>
     </dict>
@@ -3520,6 +3524,108 @@ ipsw_prepare_systemversion() {
     mkdir -p System/Library/CoreServices
     mv SystemVersion.plist System/Library/CoreServices
     tar -cvf systemversion.tar System
+}
+
+ipsw_process_appleinternal() {
+    log "Processing AppleInternal modifications..."
+    
+    # Rename custom IPSW to temp for processing
+    mv "$ipsw_custom.ipsw" temp.ipsw
+    
+    # 1. Identify Ramdisk and RootFS filenames
+    file_extract_from_archive temp.ipsw BuildManifest.plist
+    local ramdisk_name=$($PlistBuddy -c "Print BuildIdentities:0:Manifest:RestoreRamDisk:Info:Path" BuildManifest.plist | tr -d '"')
+    local rootfs_name=$($PlistBuddy -c "Print BuildIdentities:0:Manifest:OS:Info:Path" BuildManifest.plist | tr -d '"')
+    
+    if [[ -z $ramdisk_name || -z $rootfs_name ]]; then
+        error "Failed to identify Ramdisk or RootFS path from manifest."
+    fi
+    
+    log "Ramdisk: $ramdisk_name"
+    log "RootFS: $rootfs_name"
+    
+    # 2. Extract and Decrypt Ramdisk
+    file_extract_from_archive temp.ipsw "$ramdisk_name"
+    mv "$ramdisk_name" ramdisk_ai.orig
+    "$dir/xpwntool" ramdisk_ai.orig ramdisk_ai.dec
+    
+    # 3. Patch options.plist
+    local local_plist="options.plist"
+    local remote_plist="usr/local/share/restore/options.$device_model.plist"
+    
+    "$dir/hfsplus" ramdisk_ai.dec extract "$remote_plist" "$local_plist" &>/dev/null
+    
+    if [[ ! -s "$local_plist" ]]; then
+        remote_plist="usr/local/share/restore/options.plist"
+        "$dir/hfsplus" ramdisk_ai.dec extract "$remote_plist" "$local_plist" &>/dev/null
+    fi
+    
+    if [[ ! -s "$local_plist" ]]; then
+        warn "Could not extract options.plist from ramdisk. AppleInternal patching might fail."
+    else
+        log "Modifying $remote_plist with size $appleinternal_part_size"
+        
+        if [[ $platform == "macos" ]]; then
+            $PlistBuddy -c "Set :SystemPartitionSize $appleinternal_part_size" "$local_plist"
+            $PlistBuddy -c "Set :MinimumSystemPartition $appleinternal_part_size" "$local_plist" 2>/dev/null || $PlistBuddy -c "Add :MinimumSystemPartition integer $appleinternal_part_size" "$local_plist"
+        else
+            sed -i "/<key>SystemPartitionSize<\/key>/{n;s/<integer>.*<\/integer>/<integer>$appleinternal_part_size<\/integer>/;}" "$local_plist"
+            sed -i "/<key>MinimumSystemPartition<\/key>/{n;s/<integer>.*<\/integer>/<integer>$appleinternal_part_size<\/integer>/;}" "$local_plist"
+        fi
+        
+        "$dir/hfsplus" ramdisk_ai.dec rm "$remote_plist"
+        "$dir/hfsplus" ramdisk_ai.dec add "$local_plist" "$remote_plist"
+        rm -f "$local_plist"
+    fi
+    
+    # 4. Repack Ramdisk and Update IPSW
+    "$dir/xpwntool" ramdisk_ai.dec "$ramdisk_name" -t ramdisk_ai.orig
+    zip -0 temp.ipsw "$ramdisk_name"
+    
+    # 5. Swap and Inject RootFS
+    if [[ -f "iBoot.tar" ]]; then
+        log "iBoot.tar detected. Converting AppleInternal DMG for injection..."
+        
+        # Convert UDZO/Compressed DMG to Raw HFS+ for modification
+        # We use a temp filename for the raw image
+        "$dir/dmg" extract "$appleinternal_dmg_path" rootfs_ai.raw
+        
+        if [[ ! -s rootfs_ai.raw ]]; then
+            error "Failed to convert AppleInternal DMG to raw format."
+        fi
+        
+        log "Injecting bootloader into AppleInternal RootFS..."
+        mkdir -p temp_iboot_extract
+        tar -xf iBoot.tar -C temp_iboot_extract
+        
+        for file in temp_iboot_extract/*; do
+            if [[ -f "$file" ]]; then
+                local filename=$(basename "$file")
+                log "Injecting $filename..."
+                "$dir/hfsplus" rootfs_ai.raw add "$file" "/$filename"
+                "$dir/hfsplus" rootfs_ai.raw chmod 755 "/$filename"
+                "$dir/hfsplus" rootfs_ai.raw chown 0:0 "/$filename"
+            fi
+        done
+        rm -rf temp_iboot_extract
+        
+        log "Rebuilding RootFS..."
+        "$dir/dmg" build rootfs_ai.raw "$rootfs_name"
+        rm -f rootfs_ai.raw
+        
+        # Update IPSW with the new rebuilt DMG
+        zip -0 temp.ipsw "$rootfs_name"
+        rm -f "$rootfs_name"
+    else
+        log "Replacing RootFS with AppleInternal DMG..."
+        cp "$appleinternal_dmg_path" "$rootfs_name"
+        zip -0 temp.ipsw "$rootfs_name"
+    fi
+    
+    # Rename back to final custom name
+    mv temp.ipsw "$ipsw_custom.ipsw"
+    
+    log "AppleInternal processing complete."
 }
 
 ipsw_prepare_bundle() {
@@ -3808,6 +3914,68 @@ ipsw_prepare_bundle() {
     cat $NewPlist
 }
 
+ipsw_patch_iboot_args() {
+    log "Processing iBoot args patch..."
+    
+    # Verify patcher exists
+    if [[ ! -f "../bin/hex_patcher.py" ]]; then
+        warn "hex_patcher.py not found in ../bin/. Skipping iBoot args patch."
+        return
+    fi
+
+    # Determine flag based on verbose selection
+    local flag="-r"
+    if [[ $ipsw_verbose == 1 ]]; then
+        flag="-a"
+    fi
+
+    mv "$ipsw_custom.ipsw" temp.ipsw
+    
+    # 1. Locate iBoot2 in the IPSW
+    # We search for it because the path varies (Firmware/all_flash/all_flash.x.production/iBoot2...)
+    local full_path=$(unzip -Z1 temp.ipsw | grep "iBoot2.*.img3" | head -1)
+    
+    if [[ -z $full_path ]]; then
+        warn "Could not find iBoot2 in custom IPSW. Skipping args patch."
+        mv temp.ipsw "$ipsw_custom.ipsw"
+        return
+    fi
+    
+    local iboot_filename=$(basename "$full_path")
+    log "Found iBoot2: $iboot_filename"
+    
+    # 2. Extract
+    unzip -j temp.ipsw "$full_path" -d .
+    
+    # 3. Decrypt/Raw (xpwntool with no keys strips img3 tags)
+    "$dir/xpwntool" "$iboot_filename" iboot.raw
+    
+    # 4. Patch with Python script
+    log "Running hex_patcher.py with flag $flag"
+    python3 ../bin/hex_patcher.py iboot.raw $flag
+    
+    if [[ $? != 0 ]]; then
+        error "hex_patcher.py failed."
+    fi
+    
+    # 5. Repack
+    "$dir/xpwntool" iboot.raw iboot.patched -t "$iboot_filename"
+    
+    # 6. Update IPSW
+    # We must recreate the directory structure to zip it back into the correct place
+    local dir_struct=$(dirname "$full_path")
+    mkdir -p "$dir_struct"
+    mv iboot.patched "$dir_struct/$iboot_filename"
+    
+    zip -u temp.ipsw "$dir_struct/$iboot_filename"
+    
+    # Cleanup
+    rm -rf Firmware iboot.raw "$iboot_filename"
+    mv temp.ipsw "$ipsw_custom.ipsw"
+    
+    log "iBoot args patch complete."
+}
+
 ipsw_prepare_32bit() {
     local ExtraArgs
     local daibutsu
@@ -3963,6 +4131,13 @@ ipsw_prepare_32bit() {
     fi
 
     mv temp.ipsw "$ipsw_custom.ipsw"
+
+    # iBoot Args Patch Hook
+    if [[ $use_premade_custom != 1 ]]; then
+        ipsw_patch_iboot_args
+    fi
+    
+    # ENSURE NO ipsw_process_appleinternal CALL IS HERE
 }
 
 ipsw_bbdigest() {
@@ -5097,7 +5272,7 @@ ipsw_prepare_powder() {
             ExtraArr[0]+="9"
         fi
         if [[ $ipsw_jailbreak == 1 && $device_target_vers != "7"* ]]; then
-            bootargs+=" cs_enforcement_disable=1 amfi_get_out_of_my_way=1 amfi=0xff"
+            bootargs+=" amfi_get_out_of_my_way=1"
         fi
         ExtraArr+=("-b" "$bootargs")
         patch_iboot "${ExtraArr[@]}"
@@ -5149,6 +5324,14 @@ ipsw_prepare_powder() {
     ipsw_bbreplace
 
     mv temp.ipsw "$ipsw_custom.ipsw"
+
+    # iBoot Args Patch Hook
+    # Allowed for AppleInternal now.
+    if [[ ! -f "iBoot.tar" && $use_premade_custom != 1 ]]; then
+        ipsw_patch_iboot_args
+    fi
+    
+    # ENSURE NO ipsw_process_appleinternal CALL IS HERE
 }
 
 ipsw_prepare_patchcomp() {
@@ -5387,10 +5570,7 @@ ipsw_prepare_custom() {
             ipsw_prepare_patchcomp LLB
             local bootargs="$device_bootargs_default"
             if [[ $ipsw_verbose == 1 ]]; then
-                bootargs="pio-error=0 -v"
-            fi
-            if [[ $device_target_vers == "3"* ]]; then
-                bootargs+=" amfi=0xff cs_enforcement_disable=1"
+                bootargs="pio-error=0 -v amfi=0xff cs_enforcement_disable=1"
             fi
             local path="Firmware/all_flash/all_flash.${device_model}ap.production"
             local name="iBoot.${device_model}ap.RELEASE.img3"
@@ -6094,36 +6274,54 @@ restore_notpwned64() {
     restore_futurerestore
 }
 
+select_custom_file() {
+    local prompt="$1"
+    local filter="$2"
+    local custom_dir="../custom"
+    
+    if [[ ! -d "$custom_dir" ]]; then
+       error "The 'custom' folder was not found." "Please create a folder named 'custom' in the Legacy-iOS-Kit directory and place your files there."
+    fi
+    
+    local files=($(ls "$custom_dir"/$filter 2>/dev/null))
+    if [[ ${#files[@]} -eq 0 ]]; then
+        error "No files found in 'custom' folder matching: $filter"
+    fi
+    
+    local options=()
+    for f in "${files[@]}"; do
+        options+=("$(basename "$f")")
+    done
+    
+    print "$prompt"
+    select_option "${options[@]}"
+    local selected="${options[$?]}"
+    
+    # Set global variable instead of echoing
+    selected_custom_file="$custom_dir/$selected"
+}
+
 ipsw_prepare() {
     if [[ $use_premade_custom == 1 ]]; then
-        log "Checking for premade custom firmware in 'custom' folder..."
-        if [[ ! -d "../custom" ]]; then
-            error "The 'custom' folder was not found." "Please create a folder named 'custom' in the Legacy-iOS-Kit directory and place your IPSWs there."
-        fi
-
-        # Check Main IPSW
-        if [[ ! -f "$ipsw_custom.ipsw" ]]; then
-            error "Custom IPSW not found!" "Expected: $ipsw_custom.ipsw"
-        fi
-
-        # Check NOR IPSW for old powdersn0w
+        log "Custom Firmware Mode: Preparing selection menu..."
+        
+        # Select Main IPSW
+        select_custom_file "Select your Custom MAIN IPSW:" "*.ipsw"
+        ipsw_custom="${selected_custom_file%.ipsw}" # Remove extension as script adds it later
+        
+        # Check if NOR IPSW (Part 1) is required
         if [[ $device_target_powder == 1 ]] && [[ $device_target_vers == "3"* || $device_target_vers == "4.0"* || $device_target_vers == "4.1"* || $device_target_vers == "4.2"* ]]; then
-            # Manually construct the Part 1 filename to ensure it matches the script's creation logic (CustomNP-<ECID>)
-            ipsw_custom_part1="../custom/${device_type}_${device_target_vers}_${device_target_build}_CustomNP-${device_ecid}"
+            select_custom_file "Select your Custom NOR IPSW (Part 1):" "*.ipsw"
+            ipsw_custom_part1="${selected_custom_file%.ipsw}" # Remove extension
             
-            if [[ ! -f "$ipsw_custom_part1.ipsw" ]]; then
-                error "Custom NOR IPSW (Part 1) not found!" "Expected: $ipsw_custom_part1.ipsw"
-            fi
-            
-            # Check iBoot3 for iPad 1 iOS 3.2
+            # Check if iBoot3 is required (iPad 1 iOS 3.2 specific)
             if [[ $device_type == "iPad1,1" && $device_target_vers == "3.2"* ]]; then
-                if [[ ! -f "../custom/iBoot3_$device_ecid" ]]; then
-                    error "Custom iBoot3 file not found!" "Expected: ../custom/iBoot3_$device_ecid"
-                fi
+                 select_custom_file "Select your iBoot3 file:" "iBoot3*"
+                 custom_iboot3_path="$selected_custom_file"
             fi
         fi
 
-        log "Custom firmware files found. Skipping IPSW creation."
+        log "Custom firmware files selected. Skipping IPSW creation."
         return
     fi
     case $device_proc in
@@ -6201,6 +6399,10 @@ ipsw_prepare() {
             fi
         ;;
     esac
+    # Global AppleInternal Hook (Runs once at the end)
+    if [[ $ipsw_appleinternal == 1 ]]; then
+        ipsw_process_appleinternal
+    fi
 }
 
 restore_usepwndfu64_option() {
@@ -6376,11 +6578,10 @@ menu_remove4() {
             "Enable Exploit" ) rec=2;;
         esac
         
-        # Check for file if proceeding
+        # Select file if proceeding
         if [[ $use_premade_custom == 1 && $device_type == "iPad1,1" && ($selected == "Enable Exploit" || $selected == "Disable Exploit") ]]; then
-             if [[ ! -f "../custom/iBoot3_$device_ecid" ]]; then
-                 error "Custom iBoot3 file not found!" "Expected: ../custom/iBoot3_$device_ecid"
-             fi
+             select_custom_file "Select your iBoot3 file:" "iBoot3*"
+             custom_iboot3_path="$selected_custom_file"
         fi
 
         case $selected in
@@ -7193,7 +7394,7 @@ device_ramdisk_ios3exploit() {
     if [[ $device_type == "iPad1,1" ]]; then
         local iboot3_path="../saved/iPad1,1/iBoot3_$device_ecid"
         if [[ $use_premade_custom == 1 ]]; then
-            iboot3_path="../custom/iBoot3_$device_ecid"
+            iboot3_path="$custom_iboot3_path"
         fi
         $scp -P $ssh_port "$iboot3_path" root@127.0.0.1:/mnt1/iBEC
     fi
@@ -8727,6 +8928,238 @@ ipsw_hwmodel_set() {
     ipsw_hwmodel="$hwmodel"
 }
 
+menu_dmg_browse() {
+    local newpath
+    input "Select your AppleInternal DMG file in the file selection window."
+    menu_zenity_check
+    newpath="$($zenity --file-selection --file-filter='DMG | *.dmg' --title="Select AppleInternal DMG")"
+    [[ ! -s "$newpath" ]] && read -p "$(input "Enter path to DMG file (or press Enter/Return or Ctrl+C to cancel): ")" newpath
+    
+    if [[ -s "$newpath" ]]; then
+        appleinternal_dmg_path="$newpath"
+        log "Selected DMG: $appleinternal_dmg_path"
+        
+        # 1. Calculate partition size
+        if [[ -f "../bin/dmg_plist.py" ]]; then
+            log "Calculating partition size..."
+            appleinternal_part_size=$(python3 ../bin/dmg_plist.py "$appleinternal_dmg_path")
+            if [[ "$appleinternal_part_size" =~ ^[0-9]+$ ]]; then
+                log "Calculated SystemPartitionSize: $appleinternal_part_size"
+            else
+                error "Failed to calculate partition size. Output: $appleinternal_part_size"
+            fi
+        else
+            error "dmg_plist.py not found in ../bin/"
+        fi
+
+        # 2. Extract ProductBuildVersion from DMG
+        log "Extracting Build ID from DMG..."
+        rm -f tmp_ai_ver.plist
+        
+        # Use 7z with wildcard to match Volume Name
+        if command -v 7z >/dev/null; then
+            7z e "$appleinternal_dmg_path" "*System/Library/CoreServices/SystemVersion.plist" -r -y >/dev/null 2>&1
+            if [[ -s "SystemVersion.plist" ]]; then
+                mv SystemVersion.plist tmp_ai_ver.plist
+            fi
+        else
+            error "7z (p7zip) is required for AppleInternal support but was not found."
+        fi
+        
+        if [[ ! -s tmp_ai_ver.plist ]]; then
+            error "Failed to read SystemVersion.plist from AppleInternal DMG." "* Ensure the DMG is a valid iOS Restore/RootFS image."
+        fi
+
+        # Parse Build Version
+        if [[ $platform == "macos" ]]; then
+            appleinternal_build_id=$(plutil -extract 'ProductBuildVersion' xml1 tmp_ai_ver.plist -o - | sed -ne '/<string>/,/<\/string>/p' | sed -e "s/<string>//" | sed "s/<\/string>//" | sed '2d')
+        else
+            appleinternal_build_id=$(grep -A1 "ProductBuildVersion" tmp_ai_ver.plist | grep -oPm1 "(?<=<string>)[^<]+")
+        fi
+        
+        # Force remove the temp file to avoid write-protected file prompts
+        rm -f tmp_ai_ver.plist
+        
+        if [[ -z $appleinternal_build_id ]]; then
+            error "Could not determine ProductBuildVersion from DMG."
+        fi
+        log "Detected Internal Build ID: $appleinternal_build_id"
+    fi
+}
+
+menu_ipsw_appleinternal() {
+    local menu_items
+    local selected
+    local back
+    local parent_mode="$1" # powdersn0w or Tethered
+    
+    # Reset selections on entry
+    ipsw_path=""
+    ipsw_base_path=""
+    appleinternal_dmg_path=""
+    appleinternal_part_size=""
+    appleinternal_build_id=""
+    ipsw_customlogo=""
+    ipsw_customrecovery=""
+    ipsw_cancustomlogo=""
+    ipsw_cancustomlogo2=""
+    
+    while [[ -z "$mode" && -z "$back" ]]; do
+        # 1. Determine Logo Capabilities based on version
+        ipsw_cancustomlogo=""
+        ipsw_cancustomlogo2=""
+        
+        if [[ -n $device_target_vers ]]; then
+            # Logic mirrored from menu_restore
+            if [[ $device_proc == 1 ]]; then
+                ipsw_cancustomlogo=1
+            elif [[ $device_type == "iPhone2,1" && $device_target_vers != "4.1" ]]; then
+                ipsw_cancustomlogo=1
+            elif [[ $device_type == "iPod2,1" && $device_target_vers != "3.1.3" ]]; then
+                # Check for new bootrom restriction if needed, generally enabled for 2.x/3.x custom
+                if [[ $device_target_vers == "4.0"* || $device_target_vers == "3.1"* ]]; then
+                    ipsw_cancustomlogo=1
+                fi
+            fi
+            
+            # Powdersn0w specific logo support (iOS 4/5/6)
+            if [[ $parent_mode == *"powdersn0w"* ]]; then
+                case $device_target_vers in
+                    [456]* ) ipsw_cancustomlogo2=1;;
+                esac
+            fi
+        fi
+
+        # 2. Build Menu
+        menu_items=("Select Target IPSW (Stock)")
+        
+        if [[ $parent_mode == *"powdersn0w"* ]]; then
+            menu_items+=("Select Base IPSW (Stock)")
+        fi
+        
+        menu_items+=("Select AppleInternal DMG")
+        
+        # Add Logo Options if supported
+        if [[ $ipsw_cancustomlogo2 == 1 ]]; then
+            menu_items+=("Select Apple Logo")
+        elif [[ $ipsw_cancustomlogo == 1 ]]; then
+            menu_items+=("Select Apple Logo" "Select Recovery Logo")
+        fi
+        
+        # Action Button Logic
+        if [[ -n $ipsw_path && -n $appleinternal_dmg_path ]]; then
+            if [[ $parent_mode == *"powdersn0w"* && -z $ipsw_base_path ]]; then
+                : # Missing base
+            else
+                # Calculate what the custom filename WILL be
+                local old_custom="$ipsw_custom" # Backup
+                ipsw_custom_set # Generate path
+                local check_path="$ipsw_custom.ipsw"
+                
+                if [[ $2 == "restore" ]]; then
+                    if [[ -f "$check_path" ]]; then
+                        menu_items+=("(*) Restore Existing AppleInternal IPSW")
+                    else
+                        menu_items+=("(*) Create & Restore AppleInternal IPSW")
+                    fi
+                else
+                    menu_items+=("(*) Create AppleInternal IPSW")
+                fi
+                ipsw_custom="$old_custom" # Restore
+            fi
+        fi
+        
+        menu_items+=("Go Back")
+        
+        # 3. Print Info
+        menu_print_info
+        if [[ $2 == "restore" ]]; then
+            print " > Main Menu > Restore/Downgrade > AppleInternal"
+        else
+            print " > ... > Create Custom IPSW > $parent_mode > AppleInternal"
+        fi
+        echo
+        if [[ -n $ipsw_path ]]; then
+            print "* Target Stock IPSW: $(basename "$ipsw_path").ipsw"
+        else
+            print "* Target Stock IPSW: [Not Selected]"
+        fi
+        
+        if [[ $parent_mode == *"powdersn0w"* ]]; then
+            if [[ -n $ipsw_base_path ]]; then
+                print "* Base Stock IPSW:   $(basename "$ipsw_base_path").ipsw"
+            else
+                print "* Base Stock IPSW:   [Not Selected]"
+            fi
+        fi
+        
+        if [[ -n $appleinternal_dmg_path ]]; then
+            print "* AppleInternal DMG: $(basename "$appleinternal_dmg_path")"
+            print "* Partition Size:    $appleinternal_part_size MB"
+            print "* Internal Build:    $appleinternal_build_id"
+        else
+            print "* AppleInternal DMG: [Not Selected]"
+        fi
+        echo
+        
+        # Print Logo Info & Warnings
+        if [[ $ipsw_cancustomlogo2 == 1 ]]; then
+            print "* You can select your own custom Apple logo image. This is optional and an experimental option"
+            print "* Note: The images must be in PNG format, and up to your device resolution"
+            print "* Note 2: The custom images might not work, current support is spotty"
+            if [[ -n $ipsw_customlogo ]]; then
+                print "* Custom Apple Logo: $(basename "$ipsw_customlogo")"
+            else
+                print "* No custom Apple logo selected"
+            fi
+        elif [[ $ipsw_cancustomlogo == 1 ]]; then
+            print "* You can select your own custom logo and recovery image. This is optional and an experimental option"
+            print "* Note: The images must be in PNG format, and up to 320x480 resolution"
+            print "* Note 2: The custom images might not work, current support is spotty"
+            if [[ -n $ipsw_customlogo ]]; then
+                print "* Custom Apple Logo: $(basename "$ipsw_customlogo")"
+            else
+                print "* No custom Apple logo selected"
+            fi
+            if [[ -n $ipsw_customrecovery ]]; then
+                print "* Custom Recovery:   $(basename "$ipsw_customrecovery")"
+            else
+                print "* No custom recovery logo selected"
+            fi
+        fi
+        echo 
+        
+        # 4. Input Handler
+        input "Select an option:"
+        select_option "${menu_items[@]}"
+        selected="${menu_items[$?]}"
+        
+        case $selected in
+            "Select Target IPSW (Stock)" ) menu_ipsw_browse "";;
+            "Select Base IPSW (Stock)" ) menu_ipsw_browse "base";;
+            "Select AppleInternal DMG" ) menu_dmg_browse;;
+            "Select Apple Logo" ) menu_logo_browse "boot";;
+            "Select Recovery Logo" ) menu_logo_browse "recovery";;
+            "(*) Create AppleInternal IPSW" ) 
+                mode="custom-ipsw"
+            ;;
+            "(*) Restore Existing AppleInternal IPSW" )
+                ipsw_custom_set # Set the variable correctly
+                mode="downgrade"
+            ;;
+            "(*) Create & Restore AppleInternal IPSW" )
+                mode="downgrade"
+            ;;
+            "Go Back" ) 
+                back=1
+                ipsw_appleinternal= # Clear flag
+                ipsw_customlogo=
+                ipsw_customrecovery=
+            ;;
+        esac
+    done
+}
+
 menu_ipsw() {
     local menu_items
     local selected
@@ -9066,33 +9499,35 @@ menu_ipsw() {
             echo
         fi
 
-        if [[ $ipsw_cancustomlogo2 == 1 ]]; then
-            print "* You can select your own custom Apple logo image. This is optional and an experimental option"
-            print "* Note: The images must be in PNG format, and up to your device resolution"
-            print "* Note 2: The custom images might not work, current support is spotty"
-            if [[ -n $ipsw_customlogo ]]; then
-                print "* Custom Apple logo: $ipsw_customlogo"
-            else
-                print "* No custom Apple logo selected"
+        if [[ $use_premade_custom != 1 ]]; then
+            if [[ $ipsw_cancustomlogo2 == 1 ]]; then
+                print "* You can select your own custom Apple logo image. This is optional and an experimental option"
+                print "* Note: The images must be in PNG format, and up to your device resolution"
+                print "* Note 2: The custom images might not work, current support is spotty"
+                if [[ -n $ipsw_customlogo ]]; then
+                    print "* Custom Apple logo: $ipsw_customlogo"
+                else
+                    print "* No custom Apple logo selected"
+                fi
+                menu_items+=("Select Apple Logo")
+                echo
+            elif [[ $ipsw_cancustomlogo == 1 ]]; then
+                print "* You can select your own custom logo and recovery image. This is optional and an experimental option"
+                print "* Note: The images must be in PNG format, and up to 320x480 resolution"
+                print "* Note 2: The custom images might not work, current support is spotty"
+                if [[ -n $ipsw_customlogo ]]; then
+                    print "* Custom Apple logo: $ipsw_customlogo"
+                else
+                    print "* No custom Apple logo selected"
+                fi
+                if [[ -n $ipsw_customrecovery ]]; then
+                    print "* Custom recovery logo: $ipsw_customrecovery"
+                else
+                    print "* No custom recovery logo selected"
+                fi
+                menu_items+=("Select Apple Logo" "Select Recovery Logo")
+                echo
             fi
-            menu_items+=("Select Apple Logo")
-            echo
-        elif [[ $ipsw_cancustomlogo == 1 ]]; then
-            print "* You can select your own custom logo and recovery image. This is optional and an experimental option"
-            print "* Note: The images must be in PNG format, and up to 320x480 resolution"
-            print "* Note 2: The custom images might not work, current support is spotty"
-            if [[ -n $ipsw_customlogo ]]; then
-                print "* Custom Apple logo: $ipsw_customlogo"
-            else
-                print "* No custom Apple logo selected"
-            fi
-            if [[ -n $ipsw_customrecovery ]]; then
-                print "* Custom recovery logo: $ipsw_customrecovery"
-            else
-                print "* No custom recovery logo selected"
-            fi
-            menu_items+=("Select Apple Logo" "Select Recovery Logo")
-            echo
         fi
         
         # Add Custom Firmware toggle here
@@ -9100,6 +9535,11 @@ menu_ipsw() {
             local custom_status="OFF"
             [[ $use_premade_custom == 1 ]] && custom_status="ON"
             menu_items+=("Custom Firmware [$custom_status]")
+        fi
+
+        # AppleInternal Menu Option
+        if [[ $1 == *"powdersn0w"* || $1 == *"Tethered"* ]]; then
+            menu_items+=("AppleInternal")
         fi
 
         menu_items+=("Go Back")
@@ -9165,6 +9605,22 @@ menu_ipsw() {
             "Download Base IPSW" ) ipsw_download "../$ipsw_latest_path" latest;;
             "Select Apple Logo" ) menu_logo_browse "boot";;
             "Select Recovery Logo" ) menu_logo_browse "recovery";;
+            "AppleInternal" )
+                ipsw_appleinternal=1
+                
+                # Determine context: if $2 is "ipsw", we are in Create mode. Otherwise, Restore mode.
+                local ai_context="restore"
+                if [[ $2 == "ipsw" ]]; then
+                    ai_context=""
+                fi
+                
+                menu_ipsw_appleinternal "$1" "$ai_context"
+                
+                # If we returned from the submenu without setting mode (Cancel), ensure flag is cleared
+                if [[ -z $mode ]]; then
+                    ipsw_appleinternal=
+                fi
+            ;;
             "Go Back" )
                 back=1
                 use_premade_custom=
@@ -9420,6 +9876,14 @@ ipsw_custom_set() {
     fi
     if [[ $use_premade_custom == 1 ]]; then
         ipsw_custom="../custom/$(basename "$ipsw_custom")"
+    fi
+    if [[ $ipsw_appleinternal == 1 && -n $appleinternal_build_id ]]; then
+        # Replace the stock build ID in the path with the AppleInternal Build ID
+        # Syntax: ${variable//pattern/replacement}
+        ipsw_custom="${ipsw_custom//$device_target_build/$appleinternal_build_id}"
+    elif [[ $ipsw_appleinternal == 1 ]]; then
+        # Fallback if build ID extraction failed for some reason
+        ipsw_custom+="A"
     fi
 }
 
