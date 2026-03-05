@@ -8956,14 +8956,14 @@ menu_dmg_browse() {
         log "Extracting Build ID from DMG..."
         rm -f tmp_ai_ver.plist
         
-        # Use 7z with wildcard to match Volume Name
-        if command -v 7z >/dev/null; then
-            7z e "$appleinternal_dmg_path" "*System/Library/CoreServices/SystemVersion.plist" -r -y >/dev/null 2>&1
+        # Use bundled 7zz directly from the platform's binary directory
+        if [[ -x "$dir/7zz" ]]; then
+            "$dir/7zz" e "$appleinternal_dmg_path" "*System/Library/CoreServices/SystemVersion.plist" -r -y >/dev/null 2>&1
             if [[ -s "SystemVersion.plist" ]]; then
                 mv SystemVersion.plist tmp_ai_ver.plist
             fi
         else
-            error "7z (p7zip) is required for AppleInternal support but was not found."
+            error "7zz binary not found or not executable in $dir."
         fi
         
         if [[ ! -s tmp_ai_ver.plist ]]; then
@@ -8977,7 +8977,7 @@ menu_dmg_browse() {
             appleinternal_build_id=$(grep -A1 "ProductBuildVersion" tmp_ai_ver.plist | grep -oPm1 "(?<=<string>)[^<]+")
         fi
         
-        # Force remove the temp file to avoid write-protected file prompts
+        # Force remove the temp file
         rm -f tmp_ai_ver.plist
         
         if [[ -z $appleinternal_build_id ]]; then
