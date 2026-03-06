@@ -14,12 +14,10 @@ jobs:
       - name: Create name version env
         run: |
           export TZ=UTC
+          # Get timestamp of the last commit
           ts=$(git log -1 --format=%ct)
-          yy=$(date -d "@$ts" +%y)
-          mm=$(date -d "@$ts" +%m)
-          month_start=$(date -d "20$yy-$mm-01 00:00:00" +%s)
-          count=$(git rev-list --count HEAD --since="$month_start")
-          version_current="v$yy.$mm.$(printf "%02d" "$count")"
+          # Format as vYY.MM.DD (e.g., v26.03.06)
+          version_current="v$(date -d "@$ts" +%y.%m.%d)"
           echo "VERSION_CURRENT=$version_current" >> $GITHUB_ENV
 
       - name: Move binaries

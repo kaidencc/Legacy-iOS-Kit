@@ -809,20 +809,13 @@ version_get() {
 
         export TZ=UTC
         local ts=$(git log -1 --format=%ct)
-        local yy
-        local mm
-        local month_start
+        
+        # Calculate vYY.MM.DD based on commit date
         if [[ $(uname) == Darwin ]]; then
-            yy=$(date -r "$ts" +%y)
-            mm=$(date -r "$ts" +%m)
-            month_start=$(date -j -f "%Y-%m-%d %H:%M:%S" "20$yy-$mm-01 00:00:00" +%s)
+            version_current="v$(date -r "$ts" +%y.%m.%d)"
         else
-            yy=$(date -d "@$ts" +%y)
-            mm=$(date -d "@$ts" +%m)
-            month_start=$(date -d "20$yy-$mm-01 00:00:00" +%s)
+            version_current="v$(date -d "@$ts" +%y.%m.%d)"
         fi
-        local count=$(git rev-list --count HEAD --since="$month_start")
-        version_current="v$yy.$mm.$(printf "%02d" "$count")"
 
     elif [[ -e ./resources/git_hash ]]; then
         version_current="$(cat ./resources/version)"
