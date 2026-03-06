@@ -3609,33 +3609,134 @@ ipsw_process_appleinternal() {
     "$dir/xpwntool" ramdisk_ai.dec "$ramdisk_name" -t ramdisk_ai.orig
     zip -0 temp.ipsw "$ramdisk_name"
     
-    # 5. Swap and Inject RootFS
+    # 5. Process RootFS
+    local do_modifications=0
+    
+    echo
+    input "AppleInternal RootFS Modification"
+    print "* Do you want to apply common fixes/patches to the AppleInternal firmware?"
+    print "* This includes removing the FIPS directory and cleaning up securekeyvaultd binaries."
+    if (( target_vers_maj >= 7 )); then
+        print "* For iOS 7+, this also enables options for stock component replacement."
+    fi
+    print "* This is recommended."
+    select_yesno "Apply modifications?" 1
+    if [[ $? == 1 ]]; then
+        do_modifications=1
+    fi
+    
+    local has_iboot=0
     if [[ -f "iBoot.tar" ]]; then
-        log "iBoot.tar detected. Converting AppleInternal DMG for injection..."
+        has_iboot=1
+    fi
+    
+    if [[ $do_modifications == 0 && $has_iboot == 0 ]]; then
+        log "No modifications requested and no bootloader injection needed."
+        log "Replacing RootFS with AppleInternal DMG (Direct Copy)..."
+        cp "$appleinternal_dmg_path" "$rootfs_name"
+        zip -0 temp.ipsw "$rootfs_name"
+        rm -f "$rootfs_name"
+    else
+        log "Converting AppleInternal DMG to raw format for processing..."
         
-        # Convert UDZO/Compressed DMG to Raw HFS+ for modification
-        # We use a temp filename for the raw image
+        # Convert UDZO/Compressed DMG to Raw HFS+
         "$dir/dmg" extract "$appleinternal_dmg_path" rootfs_ai.raw
         
         if [[ ! -s rootfs_ai.raw ]]; then
             error "Failed to convert AppleInternal DMG to raw format."
         fi
         
-        log "Injecting bootloader into AppleInternal RootFS..."
-        mkdir -p temp_iboot_extract
-        tar -xf iBoot.tar -C temp_iboot_extract
-        
-        for file in temp_iboot_extract/*; do
-            if [[ -f "$file" ]]; then
-                local filename=$(basename "$file")
-                log "Injecting $filename..."
-                "$dir/hfsplus" rootfs_ai.raw add "$file" "/$filename"
-                "$dir/hfsplus" rootfs_ai.raw chmod 755 "/$filename"
-                "$dir/hfsplus" rootfs_ai.raw chown 0:0 "/$filename"
+        if [[ $do_modifications == 1 ]]; then
+            # A. Perform Cleanup Operations
+            log "Removing FIPS directory..."
+            "$dir/hfsplus" rootfs_ai.raw rmall private/var/db/FIPS
+            
+            log "Cleaning up securekeyvaultd.* binaries..."
+            local skvd_list=$("$dir/hfsplus" rootfs_ai.raw ls usr/sbin | grep "securekeyvaultd\." | awk '{print $NF}')
+            
+            if [[ -n "$skvd_list" ]]; then
+                echo "$skvd_list" | while read -r file; do
+                    file=$(echo "$file" | xargs)
+                    if [[ -n "$file" ]]; then
+                        log "Removing usr/sbin/$file"
+                        "$dir/hfsplus" rootfs_ai.raw rm "usr/sbin/$file"
+                    fi
+                done
+            else
+                log "No matching securekeyvaultd files found."
             fi
-        done
-        rm -rf temp_iboot_extract
+            
+            # B. iOS 7+ Stock Components Prompt
+            if (( target_vers_maj >= 7 )); then
+                echo
+                warn "iOS 7+ AppleInternal detected."
+                print "Do you want to replace sandboxd with the stock version and set the filesystem to read-only?"
+                print "* Select 'Yes' if you are using the stock kernel."
+                print "* Select 'No' if you are using a development kernel."
+                
+                select_yesno "Use stock components?" 1
+                if [[ $? == 1 ]]; then
+                    log "Extracting stock sandboxd..."
+                    file_extract_from_archive temp.ipsw "$rootfs_name"
+                    "$dir/dmg" extract "$rootfs_name" rootfs_stock.raw
+                    "$dir/hfsplus" rootfs_stock.raw extract usr/libexec/sandboxd sandboxd
+                    
+                    if [[ -s sandboxd ]]; then
+                        log "Replacing sandboxd in AppleInternal image..."
+                        "$dir/hfsplus" rootfs_ai.raw rm usr/libexec/sandboxd
+                        "$dir/hfsplus" rootfs_ai.raw add sandboxd usr/libexec/sandboxd
+                        "$dir/hfsplus" rootfs_ai.raw chmod 755 usr/libexec/sandboxd
+                        "$dir/hfsplus" rootfs_ai.raw chown 0:0 usr/libexec/sandboxd
+                    else
+                        warn "Failed to extract stock sandboxd. Skipping replacement."
+                    fi
+                    
+                    log "Modifying fstab..."
+                    "$dir/hfsplus" rootfs_ai.raw extract private/etc/fstab fstab
+                    
+                    if [[ -s fstab ]]; then
+                        local current_mode=$(awk 'NR==1 {print $4}' fstab)
+                        if [[ "$current_mode" == "rw" ]]; then
+                            log "Changing fstab from rw to ro..."
+                            awk 'NR==1 {$4="ro"} 1' fstab > fstab.tmp && mv fstab.tmp fstab
+                            
+                            "$dir/hfsplus" rootfs_ai.raw rm private/etc/fstab
+                            "$dir/hfsplus" rootfs_ai.raw add fstab private/etc/fstab
+                            "$dir/hfsplus" rootfs_ai.raw chmod 644 private/etc/fstab
+                            "$dir/hfsplus" rootfs_ai.raw chown 0:0 private/etc/fstab
+                        else
+                            log "fstab is already set to $current_mode (or not rw). Skipping."
+                        fi
+                    else
+                        warn "Failed to extract fstab."
+                    fi
+                    
+                    rm -f "$rootfs_name" rootfs_stock.raw sandboxd fstab
+                else
+                    log "User selected No. Keeping AppleInternal components."
+                fi
+            fi
+        fi
         
+        # C. Inject iBoot/iBEC if iBoot.tar exists
+        if [[ $has_iboot == 1 ]]; then
+            log "iBoot.tar detected. Injecting bootloader into AppleInternal RootFS..."
+            mkdir -p temp_iboot_extract
+            tar -xf iBoot.tar -C temp_iboot_extract
+            
+            for file in temp_iboot_extract/*; do
+                if [[ -f "$file" ]]; then
+                    local filename=$(basename "$file")
+                    log "Injecting $filename..."
+                    "$dir/hfsplus" rootfs_ai.raw add "$file" "/$filename"
+                    "$dir/hfsplus" rootfs_ai.raw chmod 755 "/$filename"
+                    "$dir/hfsplus" rootfs_ai.raw chown 0:0 "/$filename"
+                fi
+            done
+            rm -rf temp_iboot_extract
+        fi
+        
+        # 6. Rebuild and Replace RootFS
         log "Rebuilding RootFS..."
         "$dir/dmg" build rootfs_ai.raw "$rootfs_name"
         rm -f rootfs_ai.raw
@@ -3643,10 +3744,6 @@ ipsw_process_appleinternal() {
         # Update IPSW with the new rebuilt DMG
         zip -0 temp.ipsw "$rootfs_name"
         rm -f "$rootfs_name"
-    else
-        log "Replacing RootFS with AppleInternal DMG..."
-        cp "$appleinternal_dmg_path" "$rootfs_name"
-        zip -0 temp.ipsw "$rootfs_name"
     fi
     
     # Rename back to final custom name
