@@ -836,7 +836,7 @@ version_get() {
 }
 
 version_check() {
-    if [[ $no_version_check == 1 && ! -e ../resources/new ]]; then
+    if [[ $no_version_check == 1 ]]; then
         warn "No version check flag detected, update check is disabled and no support will be provided."
         return
     fi
@@ -849,14 +849,33 @@ version_check() {
             print "* Latest version:  $version_latest ($git_hash_latest)"
             print "* Please download/pull the latest version before proceeding."
             version_update
-        elif (( $(echo $version_current | cut -c 2- | sed -e 's/\.//g') >= $(echo $version_latest | cut -c 2- | sed -e 's/\.//g') )); then
-            warn "Current version is newer/different than remote: $version_latest ($git_hash_latest)"
         else
-            print "* A newer version of Legacy iOS Kit is available."
-            print "* Current version: $version_current ($git_hash)"
-            print "* Latest version:  $version_latest ($git_hash_latest)"
-            print "* Please download/pull the latest version before proceeding."
-            version_update
+            # Prepare integers for comparison
+            local v_local=$(echo $version_current | cut -c 2- | sed -e 's/\.//g')
+            local v_remote=$(echo $version_latest | cut -c 2- | sed -e 's/\.//g')
+
+            # Check if local version is numerically greater
+            if (( v_local > v_remote )); then
+                # EDGE CASE: Transitioning from .1 patch (7 digits) back to standard CalVer (6 digits)
+                # If local is longer than remote, we assume it's the format fix, so we FORCE update.
+                if [[ ${#v_local} -gt ${#v_remote} ]]; then
+                    print "* A newer version of Legacy iOS Kit is available."
+                    print "* Current version: $version_current ($git_hash)"
+                    print "* Latest version:  $version_latest ($git_hash_latest)"
+                    print "* Please download/pull the latest version before proceeding."
+                    version_update
+                else
+                    warn "Current version is newer/different than remote: $version_latest ($git_hash_latest)"
+                fi
+            else
+                # Local is Less Than OR Equal To Remote.
+                # Since we already know hashes are different (checked above), Equal means it's a same-day update.
+                print "* A newer version of Legacy iOS Kit is available."
+                print "* Current version: $version_current ($git_hash)"
+                print "* Latest version:  $version_latest ($git_hash_latest)"
+                print "* Please download/pull the latest version before proceeding."
+                version_update
+            fi
         fi
     fi
     popd >/dev/null
