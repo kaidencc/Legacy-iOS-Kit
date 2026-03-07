@@ -844,7 +844,9 @@ version_check() {
     version_update_check
     if [[ -z $version_latest ]]; then
         warn "Failed to check for updates. GitHub may be down or blocked by your network."
-    elif [[ $git_hash_latest != "$git_hash" ]]; then
+    # Fix: Strip -dirty from local hash before comparing. 
+    # If the core commit is the same, we shouldn't prompt for an update just because of the dirty flag or a tag name change.
+    elif [[ $git_hash_latest != "${git_hash%-dirty}" ]]; then
         if [[ -z $version_current ]]; then
             print "* Latest version:  $version_latest ($git_hash_latest)"
             print "* Please download/pull the latest version before proceeding."
@@ -2689,6 +2691,32 @@ ipsw_preference_set() {
         return
     fi
 
+    # Setup.app Deletion Prompt
+    # Show for powdersn0w, tethered, SHSH restores, OR if we are explicitly in "Create Custom IPSW" mode
+    # Do NOT show for AppleInternal
+    # Range: iOS 6.x to 10.x only
+    local maj_ver=$(echo "$device_target_vers" | cut -d. -f1)
+    if [[ $ipsw_appleinternal != 1 ]] && 
+       [[ $device_target_powder == 1 || $device_target_tethered == 1 || $device_target_other == 1 || $mode == "custom-ipsw" ]] &&
+       (( maj_ver >= 6 && maj_ver <= 10 )); then
+        input "Delete Setup.app Option"
+        warn "This option removes Setup.app from the filesystem."
+        print "* This is NOT intended for iCloud bypassing or unlocking stolen devices."
+        print "* This is specifically for prototype devices or devices that cannot activate normally."
+        print "* You likely do not need this."
+        print "* This option is disabled by default (N). Select this option if unsure."
+        select_yesno "Enable this option?" 0
+        if [[ $? != 0 ]]; then
+            log "Delete Setup.app option enabled."
+            ipsw_delsetupapp=1
+            # Force custom IPSW creation since we are modifying the FS
+            ipsw_nskip=1
+        else
+            ipsw_delsetupapp=
+        fi
+        echo
+    fi
+
     # sets ipsw variables: ipsw_jailbreak, ipsw_memory, ipsw_verbose
     case $device_latest_vers in
         [76543]* ) ipsw_canjailbreak=1;;
@@ -2697,25 +2725,20 @@ ipsw_preference_set() {
        [[ $device_proc == 6 && $target_vers_maj == 10 && $device_target_other == 1 ]]; then
         ipsw_gasgauge_patch=1
     fi
-    if (( device_proc >= 7 )) || [[ $device_target_vers == "$device_latest_vers" && $ipsw_canjailbreak != 1 && $ipsw_gasgauge_patch != 1 ]]; then
+    
+    # Early return check: If no modifications are needed, return.
+    # Added ipsw_nskip check to ensure we continue if Setup.app deletion (or other mod) was selected
+    if [[ $ipsw_nskip != 1 ]] && (( device_proc >= 7 || ($device_target_vers == "$device_latest_vers" && $ipsw_canjailbreak != 1 && $ipsw_gasgauge_patch != 1) )); then
         return
     fi
 
-    # jailbreak option: available for versions 3.1.3 to 9.3.4, with some exceptions:
-    # 3.1-4.1: option is disabled due to an issue with putting .launchd_use_gmalloc in the correct partition.
-    # it should be in system, but restore puts it in data instead due to it being in var.
-    # for some reason though, it does it correctly on 4.x for 3gs and touch 2, so its enabled for those.
-    # it also does it correctly on 3.1.3-4.x for s5l8900 devices, so its also enabled there.
-    # for 3.x 3gs, and old br 3.1.3 touch 2, kernel is patched so its also supposed to be enabled for those
-    # but since there is an issue with ios 3 asr when fs is modified, they are disabled for now
-    # update: should be fixed after updating xpwn ipsw, will revert if reports say otherwise or if other issues pop up
+    # jailbreak option: available for versions 3.1.3 to 9.3.4...
     ipsw_canjailbreak=
     case $device_target_vers in
         9.3.[4321] | 9.3 | 9.[210]* | [876543].* ) ipsw_canjailbreak=1;;
     esac
 
     # ipsw_nskip being 1 means that it will always create/use a custom ipsw.
-    # useful for disabling baseband update, or in the case of macos arm64, not having to use futurerestore for 32-bit.
     case $device_type in
         iPad[23],[23] | "$device_disable_bbupdate" ) ipsw_nskip=1;;
     esac
@@ -2725,9 +2748,13 @@ ipsw_preference_set() {
          [[ $device_proc == 5 && $target_vers_maj == 4 ]]; then
         ipsw_nskip=1
     fi
+    
+    # If setup.app delete was chosen, force nskip again to be safe
+    if [[ $ipsw_delsetupapp == 1 ]]; then
+        ipsw_nskip=1
+    fi
 
     # make jailbreak option enabled for all of 8.x-9.x if the restore is a powdersn0w one.
-    # also, exit this function if ipsw_canjailbreak is not set to 1 and/or other options will not be used.
     local jbpowder
     if [[ $device_target_powder == 1 ]]; then
         case $device_target_vers in
@@ -2742,8 +2769,7 @@ ipsw_preference_set() {
         return
     fi
 
-    # detect certain ios betas now. for ios 8, disable betas 1 and 2 since powdersn0w cant patch the kernels for those.
-    # for betas below ios 6, disable the jailbreak option, its not supported since (currently) no patchfinders used there and stuff.
+    # detect certain ios betas now...
     if [[ $ipsw_isbeta == 1 ]]; then
         case $device_target_vers in
             8* )
@@ -2765,6 +2791,7 @@ ipsw_preference_set() {
         fi
     fi
 
+    # Jailbreak Logic Chain
     if [[ $ipsw_appleinternal == 1 ]]; then
         ipsw_jailbreak=
     elif [[ $ipsw_fourthree == 1 ]]; then
@@ -3762,6 +3789,50 @@ ipsw_process_appleinternal() {
     mv temp.ipsw "$ipsw_custom.ipsw"
     
     log "AppleInternal processing complete."
+}
+
+ipsw_process_setupapp() {
+    log "Processing Setup.app deletion..."
+    
+    # Rename custom IPSW to temp for processing
+    mv "$ipsw_custom.ipsw" temp.ipsw
+    
+    # 1. Identify RootFS filename
+    file_extract_from_archive temp.ipsw BuildManifest.plist
+    local rootfs_name=$($PlistBuddy -c "Print BuildIdentities:0:Manifest:OS:Info:Path" BuildManifest.plist | tr -d '"')
+    
+    if [[ -z $rootfs_name ]]; then
+        error "Failed to identify RootFS path from manifest."
+    fi
+    
+    log "RootFS: $rootfs_name"
+    
+    # 2. Extract RootFS
+    file_extract_from_archive temp.ipsw "$rootfs_name"
+    
+    # 3. Convert to raw for modification
+    "$dir/dmg" extract "$rootfs_name" rootfs_setup.raw
+    
+    if [[ ! -s rootfs_setup.raw ]]; then
+        error "Failed to convert RootFS to raw format."
+    fi
+    
+    # 4. Remove Setup.app
+    log "Deleting Applications/Setup.app..."
+    "$dir/hfsplus" rootfs_setup.raw rmall Applications/Setup.app
+    
+    # 5. Rebuild RootFS
+    "$dir/dmg" build rootfs_setup.raw "$rootfs_name"
+    rm rootfs_setup.raw
+    
+    # 6. Update IPSW
+    zip -0 temp.ipsw "$rootfs_name"
+    rm "$rootfs_name" BuildManifest.plist
+    
+    # Rename back
+    mv temp.ipsw "$ipsw_custom.ipsw"
+    
+    log "Setup.app deletion complete."
 }
 
 ipsw_prepare_bundle() {
@@ -6538,6 +6609,10 @@ ipsw_prepare() {
     # Global AppleInternal Hook (Runs once at the end)
     if [[ $ipsw_appleinternal == 1 ]]; then
         ipsw_process_appleinternal
+    fi
+    # Setup.app Deletion Hook
+    if [[ $ipsw_delsetupapp == 1 && $ipsw_appleinternal != 1 ]]; then
+        ipsw_process_setupapp
     fi
 }
 
@@ -10021,6 +10096,9 @@ ipsw_custom_set() {
     elif [[ $ipsw_appleinternal == 1 ]]; then
         # Fallback if build ID extraction failed for some reason
         ipsw_custom+="A"
+    fi
+    if [[ $ipsw_delsetupapp == 1 ]]; then
+        ipsw_custom+="S"
     fi
 }
 
