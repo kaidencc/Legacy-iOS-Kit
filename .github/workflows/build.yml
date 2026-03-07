@@ -17,7 +17,8 @@ jobs:
           # Get timestamp of the last commit
           ts=$(git log -1 --format=%ct)
           # Format as vYY.MM.DD (e.g., v26.03.06)
-          version_current="v$(date -d "@$ts" +%y.%m.%d)"
+          # Appending .1 to force update over previous commit-count based versions (260310 vs 2603071)
+          version_current="v$(date -d "@$ts" +%y.%m.%d).1"
           echo "VERSION_CURRENT=$version_current" >> $GITHUB_ENV
 
       - name: Move binaries
