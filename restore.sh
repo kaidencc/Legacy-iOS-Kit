@@ -524,6 +524,7 @@ set_tool_paths() {
         platform_ver="${1:-$(sw_vers -productVersion)}"
         IFS='.' read -r mac_majver mac_minver mac_patch <<< "$platform_ver"
         dir="../bin/macos"
+        sudo="sudo "
 
         platform_arch="$(uname -m)"
         if [[ $platform_arch == "arm64" ]]; then
@@ -7046,6 +7047,7 @@ device_ramdisk64() {
     warn "Mount filesystems at your own risk: there is a chance of bootlooping! Especially on versions older than iOS 11.3."
     print "* For more details, go to: https://github.com/LukeZGD/Legacy-iOS-Kit/wiki/SSH-Ramdisk"
 
+    if [[ $1 == "dumper" ]]; then return; fi
     menu_ramdisk $build_id
 }
 
@@ -7568,6 +7570,7 @@ device_ramdisk() {
     print "    mount.sh"
     print "* For more details, go to: https://github.com/LukeZGD/Legacy-iOS-Kit/wiki/SSH-Ramdisk"
 
+    if [[ $1 == "dumper" ]]; then return; fi
     menu_ramdisk
 }
 
@@ -8298,6 +8301,518 @@ menu_print_info() {
     echo
 }
 
+# ====================================================
+#          APPLE INTERNAL OS DUMPER
+#          Original Script by Abdur Rehman
+# ====================================================
+
+menu_appleinternal_dumper() {
+    local menu_items
+    local selected
+    local back
+
+    while [[ -z "$mode" && -z "$back" ]]; do
+        menu_print_info
+        print " > Main Menu > AppleInternal OS Dumper"
+        print "* AppleInternal OS Dumper - Original Script by Abdur Rehman"
+        print "* This tool is designed for dumping SwitchBoard and InternalUI builds"
+        echo
+        
+        menu_items=()
+        if [[ $device_argmode != "none" ]]; then
+            menu_items+=("Initiate Device Dump")
+        fi
+        
+        menu_items+=(
+            "Finalize Existing DMG - Restore-Ready DMG"
+            "Modify Existing DMG - Modifiable DMG"
+            "Convert TAR Archive - DMG"
+            "Go Back"
+        )
+        
+        input "Select an option:"
+        select_option "${menu_items[@]}"
+        selected="${menu_items[$?]}"
+
+        case $selected in
+            "Convert TAR Archive - DMG" ) dumper_convert_tar;;
+            "Finalize Existing DMG - Restore-Ready DMG" ) dumper_modify_dmg 2;;
+            "Modify Existing DMG - Modifiable DMG" ) dumper_modify_dmg 3;;
+            "Initiate Device Dump" ) dumper_initiate_dump;;
+            "Go Back" ) back=1;;
+        esac
+    done
+}
+
+dumper_convert_tar() {
+    print "* Archive Conversion Wizard"
+    local SELECTED_TAR
+    local DEST_DIR
+    
+    input "Select your TAR or compressed archive in the file selection window."
+    menu_zenity_check
+    SELECTED_TAR="$($zenity --file-selection --title="Select TAR or Compressed Archive")"
+    if [[ ! -s "$SELECTED_TAR" ]]; then
+        read -p "$(input 'Enter path to TAR file (or press Enter/Return to cancel): ')" SELECTED_TAR
+    fi
+    [[ ! -s "$SELECTED_TAR" ]] && return
+
+    input "Select destination folder in the file selection window."
+    menu_zenity_check
+    DEST_DIR="$($zenity --file-selection --directory --title="Select Destination")"
+    if [[ ! -d "$DEST_DIR" ]]; then
+        read -p "$(input 'Enter path to destination folder (or press Enter/Return to cancel): ')" DEST_DIR
+    fi
+    [[ ! -d "$DEST_DIR" ]] && return
+
+    log "Analyzing archive..."
+    local TAR_FLAGS="-xpf"
+    if [[ "$SELECTED_TAR" == *.gz || "$SELECTED_TAR" == *.tgz ]]; then
+        TAR_FLAGS="-xzvpf"
+        log "Detected GZIP compression, using -z flag"
+    fi
+
+    local SAMPLE=$(tar -tf "$SELECTED_TAR" 2>/dev/null | head -n 1)
+    if [[ -z "$SAMPLE" ]]; then
+        error "Invalid TAR file."
+    fi
+
+    local STRIP_VAL=0
+    if [[ "$SAMPLE" == */* ]]; then
+        STRIP_VAL=1
+        log "Leading folder detected (mnt1), auto-stripping enabled"
+    fi
+
+    print "* Enter your Mac password if prompted to authorize archive conversion"
+    $sudo -v
+
+    local TAR_SIZE_MB=$(du -m "$SELECTED_TAR" | cut -f1)
+    local DMG_SIZE=$(( TAR_SIZE_MB + (TAR_SIZE_MB / 5) + 500 ))
+    local TEMP_DMG="${DEST_DIR}/Converted_Archive_Temp.dmg"
+    
+    log "Creating blank DMG container..."
+    hdiutil create -size "${DMG_SIZE}m" -fs "Case-sensitive HFS+" -volname "Converted" "$TEMP_DMG" -verbose >/dev/null || error "Failed to create DMG."
+
+    log "Mounting DMG with permission controls..."
+    hdiutil attach -owners on "$TEMP_DMG" -verbose >/dev/null || error "Failed to mount DMG."
+
+    log "Extracting archive..."
+    if ! $sudo tar $TAR_FLAGS "$SELECTED_TAR" --strip-components=$STRIP_VAL -C /Volumes/Converted/ >/dev/null 2>&1; then
+        error "Extraction failed. Check disk space or archive integrity."
+    fi
+
+    log "Unmounting volume..."
+    hdiutil detach /Volumes/Converted/ -verbose >/dev/null
+
+    log "Conversion completed"
+    print "* How would you like to finalize this archive?"
+    local fin_opts=("Finalize as Restore-Ready (Compressed, Read-Only)" "Keep as Modifiable (Uncompressed, Writable)")
+    select_option "${fin_opts[@]}"
+    local fin_sel=$?
+
+    local FINAL_PATH
+    if [[ $fin_sel == 0 ]]; then
+        local RESTORE_DMG="${DEST_DIR}/Converted_Archive_Restore-Ready.dmg"
+        log "Converting to compressed DMG..."
+        hdiutil convert "$TEMP_DMG" -format UDZO -o "$RESTORE_DMG" -verbose >/dev/null || error "Compression failed."
+        log "Compression successful"
+
+        log "Finalizing permissions (ASR Scan)..."
+        $sudo asr imagescan --source "$RESTORE_DMG" --verbose >/dev/null || error "ASR Scan failed."
+        log "ASR ImageScan successful"
+
+        rm -f "$TEMP_DMG"
+        FINAL_PATH="$RESTORE_DMG"
+        log "Success: Archive is now Restore-Ready"
+    else
+        local MODIFIABLE_DMG="${DEST_DIR}/Converted_Archive_Modifiable.dmg"
+        mv "$TEMP_DMG" "$MODIFIABLE_DMG"
+
+        log "Verifying integrity (Read-Only)..."
+        local VERIFY_OUTPUT=$(hdiutil attach -readonly -noautoopen -noverify -nomount "$MODIFIABLE_DMG" 2>/dev/null) || error "Integrity check FAILED."
+        local DEV_NODE=$(echo "$VERIFY_OUTPUT" | awk 'NR==1 {print $1}')
+        [[ -n "$DEV_NODE" ]] && hdiutil detach "$DEV_NODE" >/dev/null 2>&1
+        log "Integrity verified"
+
+        FINAL_PATH="$MODIFIABLE_DMG"
+        log "Success: Archive is now Uncompressed & Modifiable"
+    fi
+
+    dumper_finish_menu "$FINAL_PATH" "$fin_sel"
+}
+
+dumper_modify_dmg() {
+    local choice="$1" # 2 = Restore-Ready, 3 = Modifiable
+    print "* Local DMG Modification"
+
+    local SELECTED_DMG
+    input "Select your DMG file in the file selection window."
+    menu_zenity_check
+    SELECTED_DMG="$($zenity --file-selection --file-filter='DMG | *.dmg' --title="Select DMG file")"
+    if [[ ! -s "$SELECTED_DMG" ]]; then
+        read -p "$(input 'Enter path to DMG file (or press Enter/Return to cancel): ')" SELECTED_DMG
+    fi
+    [[ ! -s "$SELECTED_DMG" ]] && return
+
+    local DEST_DIR
+    input "Select destination folder in the file selection window."
+    menu_zenity_check
+    DEST_DIR="$($zenity --file-selection --directory --title="Select Destination")"
+    if [[ ! -d "$DEST_DIR" ]]; then
+        read -p "$(input 'Enter path to destination folder (or press Enter/Return to cancel): ')" DEST_DIR
+    fi
+    [[ ! -d "$DEST_DIR" ]] && return
+
+    print "* Enter your Mac password if prompted to authorize DMG modification"
+    $sudo -v
+
+    if [[ "$choice" == "2" ]]; then
+        local FORMAT=$(hdiutil imageinfo "$SELECTED_DMG" 2>/dev/null | grep "Format:" | awk '{print $2}')
+        if [[ "$FORMAT" == "UDZO" ]]; then
+            warn "DMG is already compressed. Running ASR scan only..."
+            $sudo asr imagescan --source "$SELECTED_DMG" --verbose >/dev/null || error "ASR Scan failed."
+            log "ASR Scan complete. File is already Restore-ready."
+            open -R "$SELECTED_DMG"
+            return
+        fi
+    fi
+
+    local VOL_NAME=$(hdiutil attach -readonly -noverify -noautoopen "$SELECTED_DMG" | grep "/Volumes/" | sed 's|.*/Volumes/||' | xargs)
+    [[ -z "$VOL_NAME" ]] && error "Could not mount source DMG."
+    hdiutil detach "/Volumes/$VOL_NAME" >/dev/null 2>&1
+
+    log "Finalizing image..."
+    local FINAL_PATH
+
+    if [[ "$choice" == "2" ]]; then
+        FINAL_PATH="${DEST_DIR}/Restore-ready_${VOL_NAME}.dmg"
+        log "Converting to compressed DMG..."
+        hdiutil convert "$SELECTED_DMG" -format UDZO -o "$FINAL_PATH" -verbose >/dev/null || error "Conversion failed."
+        log "Compression successful"
+
+        log "Finalizing permissions (ASR Scan)..."
+        $sudo asr imagescan --source "$FINAL_PATH" --verbose >/dev/null || error "ASR Scan failed."
+        log "ASR ImageScan successful"
+
+        log "The DMG has been successfully compressed and is now Restore-ready"
+        dumper_finish_menu "$FINAL_PATH" 0
+    else
+        FINAL_PATH="${DEST_DIR}/Uncompressed-Modifiable_${VOL_NAME}.dmg"
+        log "Converting to modifiable format..."
+        hdiutil convert "$SELECTED_DMG" -format UDRW -o "$FINAL_PATH" -verbose >/dev/null || error "Conversion failed."
+        log "Decompression successful"
+
+        local EXTRA_SPACE
+        read -p "$(input 'Extra space for modification in MB (Default is 0): ')" EXTRA_SPACE
+        EXTRA_SPACE=${EXTRA_SPACE:-0}
+
+        if (( EXTRA_SPACE > 0 )); then
+            log "Resizing DMG (+${EXTRA_SPACE}MB)..."
+            hdiutil resize -size +"${EXTRA_SPACE}m" "$FINAL_PATH" -verbose >/dev/null || error "Resize failed."
+            log "Resize successful"
+        fi
+
+        log "Verifying integrity (Read-Only)..."
+        local VERIFY_OUTPUT=$(hdiutil attach -readonly -noautoopen -noverify -nomount "$FINAL_PATH" 2>/dev/null) || error "Integrity check FAILED. Decompression corrupted."
+        local DEV_NODE=$(echo "$VERIFY_OUTPUT" | awk 'NR==1 {print $1}')
+        [[ -n "$DEV_NODE" ]] && hdiutil detach "$DEV_NODE" >/dev/null 2>&1
+        log "Integrity verified"
+
+        log "The DMG has been successfully decompressed into an Uncompressed & Modifiable DMG"
+        dumper_finish_menu "$FINAL_PATH" 1
+    fi
+}
+
+dumper_initiate_dump() {
+    print "* Select dump format"
+    local format_opts=("Restore-Ready DMG (Compressed, ASR-scanned)" "Modifiable DMG (Uncompressed, writable)")
+    select_option "${format_opts[@]}"
+    local FORMAT_CHOICE=$?
+
+    local EXTRA_SPACE=0
+    if [[ "$FORMAT_CHOICE" == "1" ]]; then
+         read -p "$(input 'Extra space for modification in MB (Default is 0): ')" EXTRA_SPACE
+         EXTRA_SPACE=${EXTRA_SPACE:-0}
+    fi
+
+    print "* Select SSH mode"
+    local mode_opts=("SSH Ramdisk" "SSH Live (Device is booted normally)")
+    select_option "${mode_opts[@]}"
+    local METHOD_CHOICE=$?
+
+    local S_IP="127.0.0.1"
+    local S_PORT="$ssh_port"
+    local S_USER="root"
+    local S_PASS="alpine"
+    local AUTO_SUCCESS=0
+    local DUMP_IPROXY_PID=""
+
+    # SSH Ramdisk Boot Integration
+    if [[ $METHOD_CHOICE == 0 ]]; then
+        echo
+        print "* Would you like to create and boot an SSH Ramdisk now?"
+        print "* Select 'Yes' if your device is connected in DFU/Recovery mode."
+        print "* Select 'No' if it is ALREADY booted into a ramdisk."
+        select_yesno "Boot SSH Ramdisk?" 1
+        if [[ $? == 1 ]]; then
+            device_get_info
+            if [[ $device_mode == "none" || $device_mode == "Normal" ]]; then
+                warn "Device must be in DFU or Recovery mode to boot a ramdisk."
+                print "* Please put the device in DFU mode and try again."
+                pause
+                return
+            fi
+            
+            # Temporarily set mode to dumper so it returns back to us
+            local old_mode="$mode"
+            mode="dumper"
+            device_enter_ramdisk dumper
+            mode="$old_mode"
+            
+            # device_enter_ramdisk sets iproxy_pid and waits for SSH. 
+            # We can seamlessly hook into it.
+            AUTO_SUCCESS=1
+            DUMP_IPROXY_PID=$iproxy_pid
+        fi
+    fi
+
+    # Standard Connection Flow (if not booted above)
+    if [[ $AUTO_SUCCESS == 0 ]]; then
+        print "* Select SSH connection method"
+        local ssh_opts=("Attempt auto-connect via USB" "Manual connection" "Go Back")
+        select_option "${ssh_opts[@]}"
+        local SSH_METHOD=$?
+
+        [[ $SSH_METHOD == 2 ]] && return
+
+        if [[ $SSH_METHOD == 0 ]]; then
+            log "Attempting auto-connection..."
+            log "Starting USB tunnel (iproxy)..."
+            killall iproxy 2>/dev/null
+            "$dir/iproxy" $S_PORT 22 >/dev/null 2>&1 &
+            DUMP_IPROXY_PID=$!
+
+            log "Waiting for device..."
+            local found=0
+            local attempts=0
+            while [[ $found != 1 && $attempts -lt 5 ]]; do
+                # Use actual SSH echo to verify real connection, bypassing iproxy false positives
+                if "$dir/sshpass" -p "$S_PASS" ssh -F ./ssh_config -p "$S_PORT" "$S_USER@127.0.0.1" "echo 1" &>/dev/null; then
+                    found=1
+                else
+                    sleep 2
+                    ((attempts++))
+                fi
+            done
+
+            if [[ $found == 1 ]]; then
+                log "Device found!"
+            else
+                warn "No device detected on USB, or SSH refused connection."
+                pause
+                kill "$DUMP_IPROXY_PID" 2>/dev/null
+                return
+            fi
+        else
+            read -p "$(input 'Enter Device IP Address (Default: 127.0.0.1): ')" S_IP
+            S_IP=${S_IP:-127.0.0.1}
+            read -p "$(input 'Enter SSH Port (Default: 22): ')" S_PORT
+            S_PORT=${S_PORT:-22}
+            read -p "$(input 'Enter SSH Username (Default: root): ')" S_USER
+            S_USER=${S_USER:-root}
+            read -p "$(input 'Enter Device SSH Password (Default: alpine): ')" S_PASS
+            S_PASS=${S_PASS:-alpine}
+        fi
+    fi
+
+    local TARGET_DIR
+    input "Select where to save the DMG file in the file selection window."
+    menu_zenity_check
+    TARGET_DIR="$($zenity --file-selection --directory --title="Select Save Destination")"
+    if [[ -z "$TARGET_DIR" ]]; then
+        read -p "$(input 'Enter path to save directory (or press Enter/Return to cancel): ')" TARGET_DIR
+    fi
+    if [[ ! -d "$TARGET_DIR" ]]; then
+        warn "Invalid directory selected. Operation cancelled."
+        pause
+        [[ -n "$DUMP_IPROXY_PID" ]] && kill "$DUMP_IPROXY_PID" 2>/dev/null
+        return
+    fi
+
+    log "Authentication and connection"
+    print "* Establishing permanent tunnel..."
+    $sudo -v
+
+    local SOCKET="/tmp/switchboard_master_$$.sock"
+    
+    "$dir/sshpass" -p "$S_PASS" ssh -F ./ssh_config -p "$S_PORT" -M -S "$SOCKET" -o ServerAliveInterval=15 -o ConnectTimeout=10 "$S_USER@$S_IP" -fN 2>/dev/null
+
+    if [[ -S "$SOCKET" ]]; then
+         log "SSH tunnel established"
+    else
+         [[ -n "$DUMP_IPROXY_PID" ]] && kill "$DUMP_IPROXY_PID" 2>/dev/null
+         error "SSH handshake failed. Check password or connection."
+    fi
+
+    log "Checking device partitions..."
+    # Prioritize /dev/rdisk0s1s1 over /dev/rdisk0s1 to avoid grabbing the parent slice by mistake
+    local DEVICE_PART
+    DEVICE_PART=$(ssh -F ./ssh_config -S "$SOCKET" "$S_USER@$S_IP" "if [ -e /dev/rdisk0s1s1 ]; then echo /dev/rdisk0s1s1; elif [ -e /dev/rdisk0s1 ]; then echo /dev/rdisk0s1; fi")
+    
+    if [[ -z "$DEVICE_PART" ]]; then
+        ssh -O exit -S "$SOCKET" "$S_USER@$S_IP" 2>/dev/null
+        [[ -n "$DUMP_IPROXY_PID" ]] && kill "$DUMP_IPROXY_PID" 2>/dev/null
+        error "Could not find root partition (/dev/rdisk0s1 or /dev/rdisk0s1s1) on device."
+    fi
+
+    print "* Target IP:   $S_IP"
+    print "* Target Port: $S_PORT"
+    print "* Destination: $TARGET_DIR"
+    print "* Target Part: $DEVICE_PART"
+    
+    select_yesno "Start dump? This can take up to 15 minutes." 1
+    if [[ $? != 1 ]]; then
+        ssh -O exit -S "$SOCKET" "$S_USER@$S_IP" 2>/dev/null
+        [[ -n "$DUMP_IPROXY_PID" ]] && kill "$DUMP_IPROXY_PID" 2>/dev/null
+        return
+    fi
+
+    log "Dump in progress"
+    print "* Stage:     Targeting $DEVICE_PART"
+    print "* Status:    Dumping system partition..."
+
+    if [[ $METHOD_CHOICE == 1 ]]; then
+        log "Freezing live filesystem (Read-Only)..."
+        ssh -F ./ssh_config -S "$SOCKET" "$S_USER@$S_IP" "/sbin/mount -u -o ro /" || true
+    fi
+
+    local RAW_FILE="$TARGET_DIR/RAW_DUMP_TEMP.dmg"
+    local START_TIME=$(date +%s)
+
+    log "Starting dump..."
+    ssh -F ./ssh_config -S "$SOCKET" "$S_USER@$S_IP" "dd if=$DEVICE_PART bs=64k" > "$RAW_FILE" &
+    local DUMP_PID=$!
+
+    while kill -0 "$DUMP_PID" 2>/dev/null; do
+        if [[ -f "$RAW_FILE" ]]; then
+            local size=$(du -h "$RAW_FILE" | cut -f1)
+            local elap=$(( $(date +%s) - START_TIME ))
+            local mins=$(( elap / 60 ))
+            local secs=$(( elap % 60 ))
+            printf "\r   >> [ Dumping ]  Size: %-8s |  Time Elapsed: %02d:%02d " "$size" "$mins" "$secs"
+        fi
+        sleep 2
+    done
+    echo ""
+
+    if ! wait "$DUMP_PID"; then
+        local EXIT_CODE=$?
+        rm -f "$RAW_FILE"
+        ssh -O exit -S "$SOCKET" "$S_USER@$S_IP" 2>/dev/null
+        [[ -n "$DUMP_IPROXY_PID" ]] && kill "$DUMP_IPROXY_PID" 2>/dev/null
+        error "Dump process terminated abnormally (Exit Code: $EXIT_CODE)."
+    fi
+
+    log "Build has been dumped successfully."
+    log "Verifying dump integrity..."
+
+    local VERIFY_OUTPUT=$(hdiutil attach -readonly -noautoopen -noverify -nomount "$RAW_FILE" 2>/dev/null)
+    if [[ $? != 0 ]]; then
+        rm -f "$RAW_FILE"
+        ssh -O exit -S "$SOCKET" "$S_USER@$S_IP" 2>/dev/null
+        [[ -n "$DUMP_IPROXY_PID" ]] && kill "$DUMP_IPROXY_PID" 2>/dev/null
+        error "Integrity check FAILED. Dump is corrupted or 0-byte."
+    fi
+
+    local DEV_NODE=$(echo "$VERIFY_OUTPUT" | awk 'NR==1 {print $1}')
+    if [[ -n "$DEV_NODE" ]]; then
+        hdiutil detach "$DEV_NODE" >/dev/null 2>&1 || true
+    fi
+    log "Integrity verified."
+
+    if [[ $METHOD_CHOICE == 1 ]]; then
+        log "Restoring live filesystem (Read-Write)..."
+        ssh -F ./ssh_config -S "$SOCKET" "$S_USER@$S_IP" "/sbin/mount -u -o rw /" || true
+    fi
+
+    log "SSH transfer finished"
+    ssh -O exit -S "$SOCKET" "$S_USER@$S_IP" 2>/dev/null
+    [[ -n "$DUMP_IPROXY_PID" ]] && kill "$DUMP_IPROXY_PID" 2>/dev/null
+
+    local MOUNT_INFO=$(hdiutil attach -readonly -noverify -noautoopen "$RAW_FILE" 2>/dev/null)
+    local VOL_NAME=$(echo "$MOUNT_INFO" | grep "/Volumes/" | sed 's|.*/Volumes/||' | xargs)
+    [[ -z "$VOL_NAME" ]] && VOL_NAME="Untitled_Dump"
+    hdiutil detach "/Volumes/$VOL_NAME" >/dev/null 2>&1
+
+    log "Finalizing image"
+    local FINAL_PATH
+
+    if [[ $FORMAT_CHOICE == 0 ]]; then
+        FINAL_PATH="${TARGET_DIR}/${VOL_NAME}_Restore-Ready.dmg"
+        log "Converting to compressed DMG..."
+        hdiutil convert "$RAW_FILE" -format UDZO -o "$FINAL_PATH" -verbose >/dev/null || error "Compression failed."
+        log "Compression successful"
+
+        log "Finalizing permissions (ASR Scan)..."
+        $sudo asr imagescan --source "$FINAL_PATH" --verbose >/dev/null || error "ASR Scan failed."
+        log "ASR ImageScan successful"
+        rm -f "$RAW_FILE"
+
+        log "The build has been successfully dumped and is Restore-ready"
+        dumper_finish_menu "$FINAL_PATH" 0
+    else
+        FINAL_PATH="${TARGET_DIR}/${VOL_NAME}_Uncompressed-Modifiable.dmg"
+        mv -f "$RAW_FILE" "$FINAL_PATH"
+        if (( EXTRA_SPACE > 0 )); then
+            log "Resizing DMG (+${EXTRA_SPACE}MB)..."
+            hdiutil resize -size +"${EXTRA_SPACE}m" "$FINAL_PATH" -verbose >/dev/null || error "Resize failed."
+            log "Resize successful"
+        fi
+        log "The build has been successfully dumped and is Uncompressed & Modifiable"
+        dumper_finish_menu "$FINAL_PATH" 1
+    fi
+}
+
+dumper_finish_menu() {
+    local FINAL_PATH="$1"
+    local IS_MOD="$2" # 1 = Modifiable
+    local fin_opts=()
+    [[ $IS_MOD == 1 ]] && fin_opts+=("Mount for Modification")
+    fin_opts+=("Open in Finder" "Return to Main Menu")
+
+    while true; do
+        echo
+        input "Select next action:"
+        select_option "${fin_opts[@]}"
+        local FINISH_SEL="${fin_opts[$?]}"
+
+        case "$FINISH_SEL" in
+            "Mount for Modification" )
+                log "Mounting for modification..."
+                local ATTACH_OUT=$(hdiutil attach -owners on "$FINAL_PATH")
+                local VOL_PATH=$(echo "$ATTACH_OUT" | grep -o "/Volumes/.*")
+
+                if [[ -z "$VOL_PATH" ]]; then
+                    error "Could not detect mount point."
+                else
+                    log "Volume mounted at: $VOL_PATH"
+                    print "* Make your changes now."
+                    pause
+                    log "Unmounting..."
+                    hdiutil detach "$VOL_PATH" -force >/dev/null 2>&1
+                    log "Unmounted successfully"
+                fi
+            ;;
+            "Open in Finder" )
+                open -R "$FINAL_PATH"
+            ;;
+            "Return to Main Menu" )
+                break
+            ;;
+        esac
+    done
+}
+
 menu_main() {
     local menu_items
     local selected
@@ -8338,6 +8853,9 @@ menu_main() {
         if [[ $device_mode != "none" ]]; then
             menu_items+=("Useful Utilities")
         fi
+        if [[ $platform == "macos" ]]; then
+            menu_items+=("AppleInternal OS Dumper")
+        fi
         menu_items+=("Misc Utilities")
         if [[ $device_mode == "Normal" ]] && (( device_vers_maj >= 7 )); then
             menu_items+=("Pair Device")
@@ -8354,6 +8872,7 @@ menu_main() {
             "Data Management" ) menu_datamanage;;
             "Misc Utilities" ) menu_miscutilities;;
             "Useful Utilities" ) menu_usefulutilities;;
+            "AppleInternal OS Dumper" ) menu_appleinternal_dumper;;
             "Attempt Activation" ) device_activate;;
             "Exit Recovery Mode" ) mode="exitrecovery";;
             "Just Boot" ) menu_justboot;;
