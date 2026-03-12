@@ -3,6 +3,6 @@ Host *
     IdentitiesOnly yes
     StrictHostKeyChecking no
     UserKnownHostsFile /dev/null
-    HostKeyAlgorithms +ssh-rsa,ssh-dss
+    HostKeyAlgorithms +ssh-rsa
     KexAlgorithms +diffie-hellman-group1-sha1
-    Ciphers +aes128-cbc,3des-cbc,aes256-cbc
+    Ciphers +aes128-cbc,aes256-cbc
