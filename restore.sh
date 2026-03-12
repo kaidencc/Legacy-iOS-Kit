@@ -625,11 +625,8 @@ set_tool_paths() {
     sshfs="$(command -v sshfs)"
 
     cp ../resources/ssh_config . 2>/dev/null
-    if [[ $(ssh -V 2>&1 | grep -c SSH_8.8) == 1 || $(ssh -V 2>&1 | grep -c SSH_8.9) == 1 ||
-          $(ssh -V 2>&1 | grep -c SSH_9.) == 1 || $(ssh -V 2>&1 | grep -c SSH_1) == 1 ]]; then
-        echo "    PubkeyAcceptedAlgorithms +ssh-rsa" >> ssh_config
-    elif [[ $(ssh -V 2>&1 | grep -c SSH_6) == 1 ]]; then
-        cat ../resources/ssh_config | sed "s,Add,#Add,g" | sed "s,HostKeyA,#HostKeyA,g" > ssh_config
+    if [[ $(ssh -V 2>&1 | grep -c SSH_6) == 1 ]]; then
+        cat ../resources/ssh_config | sed "s,Add,#Add,g" | sed "s,HostKeyA,#HostKeyA,g" | sed "s,KexA,#KexA,g" | sed "s,Ciphers,#Ciphers,g" > ssh_config
     fi
     scp2+=" -F ./ssh_config"
     ssh2+=" -F ./ssh_config"
@@ -6695,6 +6692,10 @@ ipsw_prepare() {
     if [[ $ipsw_delsetupapp == 1 && $ipsw_appleinternal != 1 ]]; then
         ipsw_process_setupapp
     fi
+    # Custom Kernelcache Hook
+    if [[ -n $custom_kernelcache_path && $device_target_powder == 1 ]]; then
+        ipsw_process_custom_kernelcache
+    fi
 }
 
 restore_usepwndfu64_option() {
@@ -9881,6 +9882,10 @@ menu_ipsw_appleinternal() {
             menu_items+=("Select Apple Logo" "Select Recovery Logo")
         fi
         
+        if [[ $parent_mode == *"powdersn0w"* ]]; then
+            menu_items+=("Advanced Options")
+        fi
+        
         # Action Button Logic
         if [[ -n $ipsw_path && -n $appleinternal_dmg_path ]]; then
             if [[ $parent_mode == *"powdersn0w"* && -z $ipsw_base_path ]]; then
@@ -9935,6 +9940,9 @@ menu_ipsw_appleinternal() {
         else
             print "* AppleInternal DMG: [Not Selected]"
         fi
+        if [[ $parent_mode == *"powdersn0w"* && -n $custom_kernelcache_path ]]; then
+            print "* Custom Kernel:     $(basename "$custom_kernelcache_path")"
+        fi
         echo
         
         # Print Logo Info & Warnings
@@ -9975,6 +9983,7 @@ menu_ipsw_appleinternal() {
             "Select AppleInternal DMG" ) menu_dmg_browse;;
             "Select Apple Logo" ) menu_logo_browse "boot";;
             "Select Recovery Logo" ) menu_logo_browse "recovery";;
+            "Advanced Options" ) menu_advanced_options;;
             "(*) Create AppleInternal IPSW" ) 
                 mode="custom-ipsw"
             ;;
@@ -9993,6 +10002,76 @@ menu_ipsw_appleinternal() {
             ;;
         esac
     done
+}
+
+menu_advanced_options() {
+    local menu_items
+    local selected
+    local back
+
+    while [[ -z "$mode" && -z "$back" ]]; do
+        menu_items=("Select Custom Kernelcache")
+        if [[ -n $custom_kernelcache_path ]]; then
+            menu_items+=("Clear Custom Kernelcache")
+        fi
+        menu_items+=("Go Back")
+
+        menu_print_info
+        print " > ... > Advanced Options"
+        echo
+        if [[ -n $custom_kernelcache_path ]]; then
+            print "* Custom Kernelcache: $(basename "$custom_kernelcache_path")"
+        else
+            print "* Custom Kernelcache: [Not Selected]"
+        fi
+        print "* Note: This replaces the filesystem kernelcache (not the restore kernelcache)."
+        echo
+
+        input "Select an option:"
+        select_option "${menu_items[@]}"
+        selected="${menu_items[$?]}"
+
+        case $selected in
+            "Select Custom Kernelcache" )
+                menu_kernelcache_browse
+            ;;
+            "Clear Custom Kernelcache" )
+                custom_kernelcache_path=""
+            ;;
+            "Go Back" ) back=1;;
+        esac
+    done
+}
+
+ipsw_process_custom_kernelcache() {
+    log "Processing Custom Kernelcache replacement..."
+    
+    mv "$ipsw_custom.ipsw" temp.ipsw
+    
+    # Identify Kernelcache filename from manifest
+    file_extract_from_archive temp.ipsw BuildManifest.plist
+    local kc_name=$($PlistBuddy -c "Print BuildIdentities:0:Manifest:KernelCache:Info:Path" BuildManifest.plist | tr -d '"')
+    
+    if [[ -z $kc_name ]]; then
+        warn "Failed to identify KernelCache path from manifest. Skipping replacement."
+        mv temp.ipsw "$ipsw_custom.ipsw"
+        return
+    fi
+    
+    log "Target Filesystem KernelCache: $kc_name"
+    log "Replacing with: $custom_kernelcache_path"
+    
+    # Copy the custom kernelcache to the expected filename
+    cp "$custom_kernelcache_path" "$kc_name"
+    
+    # Update IPSW
+    zip -0 temp.ipsw "$kc_name"
+    rm -f "$kc_name" BuildManifest.plist
+    
+    # Rename back
+    mv temp.ipsw "$ipsw_custom.ipsw"
+    
+    log "Custom Kernelcache replacement complete."
 }
 
 menu_ipsw() {
@@ -10376,6 +10455,11 @@ menu_ipsw() {
         if [[ $1 == *"powdersn0w"* || $1 == *"Tethered"* ]]; then
             menu_items+=("AppleInternal")
         fi
+        
+        # Advanced Options Menu (powdersn0w only)
+        if [[ $1 == *"powdersn0w"* ]]; then
+            menu_items+=("Advanced Options")
+        fi
 
         menu_items+=("Go Back")
 
@@ -10456,6 +10540,9 @@ menu_ipsw() {
                     ipsw_appleinternal=
                 fi
             ;;
+            "Advanced Options" )
+                menu_advanced_options
+            ;;
             "Go Back" )
                 back=1
                 use_premade_custom=
@@ -10464,6 +10551,7 @@ menu_ipsw() {
                 ipsw_cancustomlogo2=
                 ipsw_customlogo=
                 ipsw_customrecovery=
+                custom_kernelcache_path=
                 ipsw_path=
                 ipsw_base_path=
                 shsh_path=
@@ -10737,6 +10825,17 @@ menu_logo_browse() {
         "boot" ) ipsw_customlogo="$newpath";;
         "recovery" ) ipsw_customrecovery="$newpath";;
     esac
+}
+
+menu_kernelcache_browse() {
+    local newpath
+    input "Select your Custom Kernelcache file in the file selection window."
+    menu_zenity_check
+    newpath="$($zenity --file-selection --title="Select Custom Kernelcache file")"
+    [[ ! -s "$newpath" ]] && read -p "$(input "Enter path to Custom Kernelcache file (or press Enter/Return or Ctrl+C to cancel): ")" newpath
+    [[ ! -s "$newpath" ]] && return
+    log "Selected Custom Kernelcache file: $newpath"
+    custom_kernelcache_path="$newpath"
 }
 
 ipsw_print_1415warn() {
@@ -12272,10 +12371,7 @@ menu_justboot() {
             ;;
             "Custom Bootargs" ) read -p "$(input 'Enter custom bootargs: ')" device_bootargs;;
             "Select Custom Kernelcache" )
-                select_custom_file "Select your Custom Kernelcache file:" "*.img3"
-                if [[ -n "$selected_custom_file" ]]; then
-                    custom_kernelcache_path="$selected_custom_file"
-                fi
+                menu_kernelcache_browse
             ;;
             "Go Back" ) back=1;;
         esac
