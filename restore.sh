@@ -56,7 +56,9 @@ pause() {
 clean() {
     kill $httpserver_pid $iproxy_pid $anisette_pid $sshfs_pid 2>/dev/null
     popd &>/dev/null
-    rm -rf "$(dirname "$0")/tmp$$/"* "$(dirname "$0")/iP"*/ "$(dirname "$0")/tmp$$/" 2>/dev/null
+    [[ -d "$(dirname "$0")/tmp$$/" ]] && rm -rf "$(dirname "$0")/tmp$$/"* "$(dirname "$0")/tmp$$/"
+    [[ $noclean == 1 ]] && return
+    rm -rf "$(dirname "$0")/iP"*/
     if [[ $platform == "macos" && $(ls "$(dirname "$0")" | grep -v tmp$$ | grep -c tmp) == 0 &&
           $no_finder != 1 ]]; then
         killall -CONT AMPDevicesAgent AMPDeviceDiscoveryAgent MobileDeviceUpdater
@@ -65,11 +67,14 @@ clean() {
 
 clean_sudo() {
     clean
-    $sudo rm -rf /tmp/futurerestore /tmp/*.json "$(dirname "$0")/tmp$$/"* "$(dirname "$0")/iP"*/ "$(dirname "$0")/tmp$$/"
+    [[ -d "$(dirname "$0")/tmp$$/" ]] && $sudo rm -rf "$(dirname "$0")/tmp$$/"* "$(dirname "$0")/tmp$$/"
+    [[ $noclean == 1 ]] && return
+    $sudo rm -rf "$(dirname "$0")/iP"*/ /tmp/futurerestore /tmp/*.json
     $sudo kill $sudoloop_pid 2>/dev/null
 }
 
 clean_usbmuxd() {
+    [[ $platform != "linux" ]] && return
     if [[ $1 == "clean" ]]; then
         if [[ -z $device_disable_usbmuxd ]]; then
             log "Terminating own usbmuxd instance(s)"
@@ -86,9 +91,7 @@ clean_usbmuxd() {
     else
         clean
     fi
-    if [[ $(ls "$(dirname "$0")" | grep -v tmp$$ | grep -c tmp) != 0 ]]; then
-        return
-    fi
+    [[ $noclean == 1 ]] && return
     $sudo killall -9 usbmuxd usbmuxd2 2>/dev/null
     sleep 1
     if [[ $(command -v restorecon) ]]; then
@@ -482,7 +485,7 @@ set_tool_paths() {
             irecovery3="$sudo "
             primepwn="$sudo "
         fi
-        if [[ $(command -v gio) && ! -e ../resources/new ]]; then
+        if [[ $(command -v gio) && ! -e ../resources/new && $device_argmode != "none" ]]; then
             log "gio detected. Unmounting all iOS devices with it"
             gio mount -l | awk '/gphoto2:\/\/Apple_Inc|afc:\/\// {print $NF}' | while read -r m; do gio mount -u "$m"; done
         fi
@@ -1120,7 +1123,7 @@ device_manufacturing() {
         return
     elif [[ $device_type != "iPhone2,1" && $device_type != "iPod2,1" ]]; then
         case $device_type in
-            iPhone4,1 | iPhone5,2 | iPad3,[26] ) device_9900candidate=1;;
+            iPhone4,1 | iPhone5,2 | iPad2,7 | iPad3,[26] ) device_9900candidate=1;;
         esac
         if [[ $device_type == "DFU" ]]; then
             print "* Cannot check for manufacturing date in DFU mode"
@@ -1432,6 +1435,7 @@ device_get_info() {
         n102 ) device_type="iPod7,1";;
         n112 ) device_type="iPod9,1";;
     esac
+    device_type_lower="$(echo "$device_type" | tr '[:upper:]' '[:lower:]')"
     # device_model fallback/failsafe
     case $device_type in
         iPad1,1  ) device_model="k48";;
@@ -3141,15 +3145,63 @@ ipsw_prepare_1033() {
     log "Pwned iBSS and iBEC saved at: saved/$device_type"
 }
 
+ipsw_prepare_openssh_plist() {
+    [[ $ipsw_openssh != 1 ]] && return
+    echo "echo '<?xml version=\"1.0\" encoding=\"UTF-8\"?>
+<!DOCTYPE plist PUBLIC \"-//Apple Computer//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">
+<plist version=\"1.0\">
+
+<dict>
+    <key>Label</key>
+    <string>com.openssh.sshd</string>
+
+    <key>Program</key>
+    <string>/usr/libexec/sshd-keygen-wrapper</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/sbin/sshd</string>
+        <string>-i</string>
+    </array>
+
+    <key>SessionCreate</key>
+    <true/>
+
+    <key>Sockets</key>
+    <dict>
+        <key>Listeners</key>
+        <dict>
+            <key>SockServiceName</key>
+            <string>ssh</string>
+        </dict>
+    </dict>
+
+    <key>StandardErrorPath</key>
+    <string>/dev/null</string>
+
+    <key>inetdCompatibility</key>
+    <dict>
+        <key>Wait</key>
+        <false/>
+    </dict>
+</dict>
+
+</plist>' > /mnt1/Library/LaunchDaemons/com.openssh.sshd.plist" | tee -a reboot.sh
+}
+
 ipsw_prepare_rebootsh() {
     log "Generating reboot.sh"
     echo '#!/bin/bash' | tee reboot.sh
     echo "mount_hfs /dev/disk0s1s1 /mnt1; mount_hfs /dev/disk0s1s2 /mnt2" | tee -a reboot.sh
     echo "nvram -d boot-partition; nvram -d boot-ramdisk" | tee -a reboot.sh
-    if [[ $1 == "lyncis" ]]; then
+    if [[ $1 == "aquila" ]]; then
         echo "mv /mnt1/System/Library/LaunchDaemons/com.apple.mDNSResponder.plist_ /mnt1/Library/LaunchDaemons/com.apple.mDNSResponder.plist" | tee -a reboot.sh
-        echo "mv -v /mnt1/usr/libexec/CrashHousekeeping /mnt1/usr/libexec/CrashHousekeeping.backup; ln -s /lyncis /mnt1/usr/libexec/CrashHousekeeping" | tee -a reboot.sh
-        echo "rm /mnt1/install.sh; /sbin/reboot_" | tee -a reboot.sh
+        echo "mv /mnt1/Library/LaunchDaemons/com.apple.sandboxd.plist /mnt1/System/Library/LaunchDaemons/" | tee -a reboot.sh
+        echo "mv /mnt1/Library/LaunchDaemons/com.saurik.Cydia.Startup.plist /mnt1/System/Library/LaunchDaemons/" | tee -a reboot.sh
+        echo "mv /mnt1/usr/libexec/CrashHousekeeping /mnt1/usr/libexec/CrashHousekeeping.backup" | tee -a reboot.sh
+        echo "ln -sf /aquila /mnt1/usr/libexec/CrashHousekeeping" | tee -a reboot.sh
+        ipsw_prepare_openssh_plist
+        echo "/sbin/reboot_" | tee -a reboot.sh
     else
         echo "/usr/bin/haxx_overwrite --${device_type}_${device_target_build}" | tee -a reboot.sh
     fi
@@ -3211,10 +3263,17 @@ ipsw_prepare_jailbreak() {
     if [[ $ipsw_jailbreak == 1 ]]; then
         JBFiles+=("fstab_rw.tar")
         case $device_target_vers in
-            6.1.[3456] ) JBFiles+=("p0sixspwn.tar");;
-            6* ) JBFiles+=("evasi0n6-untether.tar");;
+            7.*  ) JBFiles+=("aquila_7.tar");;
+            #6.*  ) JBFiles+=("aquila_6.tar");;
+            #5.*  ) JBFiles+=("aquila_5.tar");;
+            4.3* ) JBFiles+=("aquila_4.tar");;
             4.[10]* | 3.2* | 3.1.3 ) JBFiles+=("greenpois0n/${device_type}_${device_target_build}.tar");;
-            5* | 4.[32]* ) JBFiles+=("g1lbertJB/${device_type}_${device_target_build}.tar");;
+
+            # temporary measure
+            6.1.[3456] ) JBFiles+=("p0sixspwn.tar");;
+            6.* ) JBFiles+=("evasi0n6-untether.tar");;
+            5.* ) JBFiles+=("g1lbertJB/${device_type}_${device_target_build}.tar");;
+
         esac
         case $device_target_vers in
             [43]* ) JBFiles[0]="fstab_old.tar"
@@ -3224,7 +3283,6 @@ ipsw_prepare_jailbreak() {
         done
         JBFiles+=("freeze.tar")
         case $device_target_vers in
-            4.3* ) [[ $device_type == "iPad2"* ]] && JBFiles[1]=;;
             4.2.[8761] )
                 if [[ $device_type == "iPhone1,2" ]]; then
                     JBFiles[1]=
@@ -3243,19 +3301,24 @@ ipsw_prepare_jailbreak() {
         case $device_target_vers in
             [543]* ) JBFiles+=("$jelbrek/cydiasubstrate.tar");;
         esac
-        if [[ $device_target_vers == "3"* ]]; then
+        if [[ $device_target_vers == "3."* ]]; then
             JBFiles+=("$jelbrek/cydiahttpatch.tar")
-        elif [[ $device_target_vers == "5"* ]]; then
+        fi
+
+        # temporary measure
+        if [[ $device_target_vers == "5."* ]]; then
             JBFiles+=("$jelbrek/g1lbertJB.tar")
         fi
-        if [[ $device_target_tethered == 1 && $device_type != "iPad2"* ]]; then
-            case $device_target_vers in
-                5* | 4.3* ) JBFiles+=("$jelbrek/g1lbertJB/install.tar");;
-            esac
+        if [[ $device_target_tethered == 1 && $device_target_vers == "5."* ]]; then
+            JBFiles+=("$jelbrek/g1lbertJB/install.tar")
         fi
+
         ExtraArgs+=" -S 30" # system partition add
         if [[ $ipsw_openssh == 1 ]]; then
-            JBFiles+=("$jelbrek/sshdeb.tar")
+            cp $jelbrek/openssh.tar.gz $jelbrek/openssl.tar.gz .
+            gzip -d openssh.tar.gz
+            gzip -d openssl.tar.gz
+            JBFiles+=("$jelbrek/sshdeb.tar" "openssh.tar" "openssl.tar")
         fi
         case $device_target_vers in
             [43]* ) :;;
@@ -3991,9 +4054,7 @@ ipsw_prepare_bundle() {
             4* ) printf "4" >> $NewPlist;;
             5* ) printf "5" >> $NewPlist;;
             6* ) printf "6" >> $NewPlist;;
-            7* ) printf "7" >> $NewPlist;; # remove for lyncis
-            #7.0* ) printf "70" >> $NewPlist;; # remove 7.0* and change 7.1* to 7* for lyncis 7.0.x
-            #7.1* ) printf "71" >> $NewPlist;;
+            7* ) printf "7" >> $NewPlist;;
             8* ) printf "8" >> $NewPlist;;
             9* ) printf "9" >> $NewPlist;;
         esac
@@ -4237,19 +4298,17 @@ ipsw_prepare_32bit() {
         log "Found existing Custom IPSW. Skipping IPSW creation."
         return
     elif [[ $ipsw_jailbreak == 1 && $ipsw_everuntether != 1 ]]; then
-        if [[ $device_target_vers == "8"* ]]; then
+        if [[ $device_target_vers == "8."* ]]; then
             daibutsu="daibutsu"
             ExtraArgs+=" -daibutsu"
             cp $jelbrek/daibutsu/bin.tar $jelbrek/daibutsu/untether.tar .
             ipsw_prepare_rebootsh
-        : ' # remove for lyncis (uncomment)
-        elif [[ $device_target_vers == "7.1"* ]]; then # change to "7"* for lyncis 7.0.x
+        elif [[ $device_target_vers == "7."* ]]; then
             daibutsu="daibutsu"
             ExtraArgs+=" -daibutsu"
             cp $jelbrek/daibutsu/bin.tar .
-            cp $jelbrek/lyncis.tar untether.tar
-            ipsw_prepare_rebootsh lyncis
-        '
+            cp $jelbrek/aquila_7.tar untether.tar
+            ipsw_prepare_rebootsh aquila
         fi
     elif [[ $ipsw_nskip == 1 ]]; then
         :
@@ -4273,23 +4332,17 @@ ipsw_prepare_32bit() {
     if [[ $ipsw_jailbreak == 1 ]]; then
         case $device_target_vers in
             9.3.[56] ) :;;
-            9* )            JBFiles+=("everuntether.tar");;
-            7.1* ) # remove for lyncis
-                case $device_type in
-                    iPod* ) JBFiles+=("panguaxe-ipod.tar");;
-                    *     ) JBFiles+=("panguaxe.tar");;
-                esac
-            ;;
-            7.0* ) # remove for lyncis 7.0.x
-                if [[ $device_type == "iPhone5,3" || $device_type == "iPhone5,4" ]] && [[ $device_target_vers == "7.0" ]]; then
-                    JBFiles+=("evasi0n7-untether-70.tar")
-                else
-                    JBFiles+=("evasi0n7-untether.tar")
-                fi
-            ;;
-            6.1.[3456] )   JBFiles+=("p0sixspwn.tar");;
-            6* )           JBFiles+=("evasi0n6-untether.tar");;
-            5* | 4.[32]* ) JBFiles+=("g1lbertJB/${device_type}_${device_target_build}.tar");;
+            9.*  ) JBFiles+=("everuntether.tar");;
+            7.*  ) JBFiles+=("aquila_7.tar");;
+            #6.*  ) JBFiles+=("aquila_6.tar");;
+            #5.*  ) JBFiles+=("aquila_5.tar");;
+            4.3* ) JBFiles+=("aquila_4.tar");;
+
+            # temporary measure
+            6.1.[3456] ) JBFiles+=("p0sixspwn.tar");;
+            6.* ) JBFiles+=("evasi0n6-untether.tar");;
+            5.* ) JBFiles+=("g1lbertJB/${device_type}_${device_target_build}.tar");;
+
         esac
         if [[ -n ${JBFiles[0]} ]]; then
             JBFiles[0]=$jelbrek/${JBFiles[0]}
@@ -4301,7 +4354,6 @@ ipsw_prepare_32bit() {
             * )  JBFiles+=("$jelbrek/fstab_rw.tar");;
         esac
         case $device_target_vers in
-            4.3* ) [[ $device_type == "iPad2"* ]] && JBFiles[0]=;;
             4.2.9 | 4.2.10 ) JBFiles[0]=;;
             4.2.[8761] )
                 ExtraArgs+=" -punchd"
@@ -4312,16 +4364,23 @@ ipsw_prepare_32bit() {
         if [[ $device_target_vers == "9"* ]]; then
             JBFiles+=("$jelbrek/launchctl.tar")
         elif [[ $device_target_vers == "5"* ]]; then
-            JBFiles+=("$jelbrek/cydiasubstrate.tar" "$jelbrek/g1lbertJB.tar")
+            JBFiles+=("$jelbrek/cydiasubstrate.tar")
         fi
         if [[ $ipsw_openssh == 1 ]]; then
-            JBFiles+=("$jelbrek/sshdeb.tar")
+            cp $jelbrek/openssh.tar.gz $jelbrek/openssl.tar.gz .
+            gzip -d openssh.tar.gz
+            gzip -d openssl.tar.gz
+            JBFiles+=("$jelbrek/sshdeb.tar" "openssh.tar" "openssl.tar")
         fi
-        if [[ $device_target_tethered == 1 ]]; then
-            case $device_target_vers in
-                5* | 4.3* ) JBFiles+=("$jelbrek/g1lbertJB/install.tar");;
-            esac
+
+        # temporary measure
+        if [[ $device_target_vers == "5."* ]]; then
+            JBFiles+=("$jelbrek/g1lbertJB.tar")
         fi
+        if [[ $device_target_tethered == 1 && $device_target_vers == "5."* ]]; then
+            JBFiles+=("$jelbrek/g1lbertJB/install.tar")
+        fi
+
         case $device_target_vers in
             [43]* ) :;;
             * ) JBFiles+=("$jelbrek/LukeZGD.tar");;
@@ -4886,7 +4945,12 @@ ipsw_prepare_ios7touch4() {
         "$dir/hfsplus" rootfs.dec untar $jelbrek/fstab_rw.tar
         "$dir/hfsplus" rootfs.dec untar $jelbrek/LukeZGD.tar
         if [[ $ipsw_openssh == 1 ]]; then
+            cp $jelbrek/openssh.tar.gz $jelbrek/openssl.tar.gz .
+            gzip -d openssh.tar.gz
+            gzip -d openssl.tar.gz
             "$dir/hfsplus" rootfs.dec untar $jelbrek/sshdeb.tar
+            "$dir/hfsplus" rootfs.dec untar openssh.tar
+            "$dir/hfsplus" rootfs.dec untar openssl.tar
         fi
         touch .cydia_no_stash
         "$dir/hfsplus" rootfs.dec add .cydia_no_stash .cydia_no_stash
@@ -5354,12 +5418,15 @@ ipsw_prepare_ios4powder() {
     fi
 
     if [[ $ipsw_jailbreak == 1 ]]; then
-        JBFiles=("g1lbertJB/${device_type}_${device_target_build}.tar" "fstab_old.tar" "cydiasubstrate.tar" "freeze.tar")
+        JBFiles=("aquila_4.tar" "fstab_old.tar" "cydiasubstrate.tar" "freeze.tar")
         for i in {0..2}; do
             JBFiles[i]=$jelbrek/${JBFiles[$i]}
         done
         if [[ $ipsw_openssh == 1 ]]; then
-            JBFiles+=("$jelbrek/sshdeb.tar")
+            cp $jelbrek/openssh.tar.gz $jelbrek/openssl.tar.gz .
+            gzip -d openssh.tar.gz
+            gzip -d openssl.tar.gz
+            JBFiles+=("$jelbrek/sshdeb.tar" "openssh.tar" "openssl.tar")
         fi
         cp $jelbrek/freeze.tar.gz .
         gzip -d freeze.tar.gz
@@ -5457,30 +5524,18 @@ ipsw_prepare_powder() {
 
     if [[ $ipsw_jailbreak == 1 ]]; then
         case $device_target_vers in
-            7.1* ) # remove for lyncis
-                ExtraArgs+=" $jelbrek/fstab7.tar"
-                case $device_type in
-                    iPod* ) ExtraArgs+=" $jelbrek/panguaxe-ipod.tar";;
-                    *     ) ExtraArgs+=" $jelbrek/panguaxe.tar";;
-                esac
-            ;;
-            #7.1* ) ExtraArgs+=" $jelbrek/lyncis.tar";; # change to 7* for lyncis 7.0.x and remove below line
-            7.0* ) # remove for lyncis 7.0.x
-                ExtraArgs+=" $jelbrek/fstab7.tar"
-                if [[ $device_type == "iPhone5,3" || $device_type == "iPhone5,4" ]] && [[ $device_target_vers == "7.0" ]]; then
-                    ExtraArgs+=" $jelbrek/evasi0n7-untether-70.tar"
-                else
-                    ExtraArgs+=" $jelbrek/evasi0n7-untether.tar"
-                fi
-            ;;
-            5*   ) ExtraArgs+=" $jelbrek/cydiasubstrate.tar $jelbrek/g1lbertJB.tar $jelbrek/g1lbertJB/${device_type}_${device_target_build}.tar";;
+            7.* ) ExtraArgs+=" $jelbrek/aquila_7.tar";;
+            5.* ) ExtraArgs+=" $jelbrek/cydiasubstrate.tar $jelbrek/aquila_5.tar";;
         esac
         case $device_target_vers in
-            [689]* ) :;;
+            [689].* ) :;;
             * ) ExtraArgs+=" freeze.tar";;
         esac
         if [[ $ipsw_openssh == 1 ]]; then
-            ExtraArgs+=" $jelbrek/sshdeb.tar"
+            cp $jelbrek/openssh.tar.gz $jelbrek/openssl.tar.gz .
+            gzip -d openssh.tar.gz
+            gzip -d openssl.tar.gz
+            ExtraArgs+=" $jelbrek/sshdeb.tar openssh.tar openssl.tar"
         fi
         ExtraArgs+=" $jelbrek/LukeZGD.tar"
         cp $jelbrek/freeze.tar.gz .
@@ -6833,7 +6888,7 @@ menu_remove4() {
 
 device_send_rdtar() {
     log "Sending and extracting $1"
-    if [[ $2 == "data" ]]; then
+    if [[ $2 == "gz" ]]; then
         cp $jelbrek/$1.gz .
         gzip -d $1.gz
         cat $1 | $ssh -p $ssh_port root@127.0.0.1 "tar -xvf - -C /mnt1"
@@ -7378,6 +7433,8 @@ device_ramdisk() {
                     log "Mounting data partition"
                     $ssh -p $ssh_port root@127.0.0.1 "mount.sh pv"
                     device_send_rdtar sshdeb.tar
+                    device_send_rdtar openssh.tar gz
+                    device_send_rdtar openssl.tar gz
                 fi
                 log "Rebooting"
                 $ssh -p "$ssh_port" root@127.0.0.1 "reboot_bak"
@@ -7386,35 +7443,28 @@ device_ramdisk() {
 
             case $vers in
                 9.3.[56] ) :;;
-                9* )         untether="everuntether.tar";;
-                8* )         untether="daibutsu/untether.tar";;
+                9.*  ) untether="everuntether.tar";;
+                8.*  ) untether="daibutsu/untether.tar";;
+                7.*  ) untether="aquila_7.tar";;
+                #6.*  ) untether="aquila_6.tar";;
+                #5.*  ) untether="aquila_5.tar";;
+                4.3* ) untether="aquila_4.tar";;
+
+                # temporary measure
                 6.1.[6543] ) untether="p0sixspwn.tar";;
-                6* )         untether="evasi0n6-untether.tar";;
-                5* )         untether="g1lbertJB/${device_type}_${build}.tar";;
-                7.1* )
-                    case $device_type in
-                        iPod* ) untether="panguaxe-ipod.tar";;
-                        *     ) untether="panguaxe.tar";;
-                    esac
-                ;;
-                #7.1* )       untether="lyncis.tar";; # change to 7* for lyncis 7.0.x and remove below line
-                7.0* ) # remove for lyncis 7.0.x
-                    untether="evasi0n7-untether.tar"
-                    if [[ $device_type == "iPhone5,3" || $device_type == "iPhone5,4" ]] && [[ $vers == "7.0" ]]; then
-                        untether="evasi0n7-untether-70.tar"
-                    fi
-                ;;
+                6.*        ) untether="evasi0n6-untether.tar";;
+                5.*        ) untether="g1lbertJB/${device_type}_${build}.tar";;
+
                 4.2.[8761] | 4.[10]* | 3.2* | 3.1.3 )
                     untether="greenpois0n/${device_type}_${build}.tar"
                 ;;
-                4.[32]* )
+                4.2* )
                     case $device_type in
                         # untether=1 means no untether package, but the var still needs to be set
-                        iPad2,* | iPhone3,3 ) untether=1;;
-                        * ) untether="g1lbertJB/${device_type}_${build}.tar";;
+                        iPhone3,3 ) untether=1;;
                     esac
                 ;;
-                3* ) [[ $device_type == "iPhone2,1" ]] && untether=1;;
+                3.* ) [[ $device_type == "iPhone2,1" ]] && untether=1;;
                 '' )
                     warn "Something wrong happened. Failed to get iOS version."
                     print "* Please reboot the device into normal operating mode, then perform a clean \"slide to power off\", then try again."
@@ -7447,13 +7497,13 @@ device_ramdisk() {
             fi
 
             # skip untether stuff for 3gs 3.x, kernel is patched for those
-            if [[ $device_type == "iPhone2,1" && $vers == "3"* ]]; then
+            if [[ $device_type == "iPhone2,1" && $vers == "3."* ]]; then
                 :
             elif [[ $untether != 1 ]]; then
                 log "Sending $untether"
                 $scp -P $ssh_port $jelbrek/$untether root@127.0.0.1:/mnt1
                 case $vers in
-                    [543]* ) untether="${device_type}_${build}.tar";; # remove folder name after sending tar
+                    [543].* ) untether="${device_type}_${build}.tar";; # remove folder name after sending tar
                 esac
                 # 3.1.3–4.1 untether must be extracted before data partition mount
                 case $vers in
@@ -7469,17 +7519,22 @@ device_ramdisk() {
 
             # do stuff
             case $vers in
-                [98]* ) device_send_rdtar fstab8.tar;;
-                7* )    device_send_rdtar fstab7.tar;;
-                6* )    device_send_rdtar fstab_rw.tar;;
+                [98].* ) device_send_rdtar fstab8.tar;;
+                7.*    ) device_send_rdtar fstab7.tar;;
+                6.*    ) device_send_rdtar fstab_rw.tar;;
                 4.2.[8761] )
                     log "launchd to punchd"
                     $ssh -p $ssh_port root@127.0.0.1 "[[ ! -e /mnt1/sbin/punchd ]] && mv /mnt1/sbin/launchd /mnt1/sbin/punchd"
                 ;;
             esac
+
+            # temporary measure
             case $vers in
-                5* ) device_send_rdtar g1lbertJB.tar;;
-                [43]* )
+                5.* ) device_send_rdtar g1lbertJB.tar;;
+            esac
+
+            case $vers in
+                [43].* )
                     log "fstab"
                     local fstab="fstab_new" # disk0s2s1 data
                     if [[ $device_proc == 1 || $device_type == "iPod2,1" ]]; then
@@ -7491,13 +7546,13 @@ device_ramdisk() {
 
             # untether extraction
             case $vers in
-                8* ) # extract now if everuntether, later if daibutsu+dsc haxx
+                8.* ) # extract now if everuntether, later if daibutsu+dsc haxx
                     if [[ $ipsw_everuntether == 1 ]]; then
                         log "Extracting $untether"
                         $ssh -p $ssh_port root@127.0.0.1 "tar -xvf /mnt1/$untether -C /mnt1; rm /mnt1/$untether"
                     fi
                 ;;
-                4.[10]* | 3* ) :;; # already extracted
+                4.[10]* | 3.* ) :;; # already extracted
                 * )
                     if [[ $untether != 1 ]]; then
                         log "Extracting $untether"
@@ -7510,31 +7565,33 @@ device_ramdisk() {
             if [[ $device_type == "iPhone2,1" && $vers == "4.3"* ]]; then
                 # 4.3.x 3gs'es have little free space in rootfs. workaround: extract an older strap that takes less space
                 cp ../saved/freeze5.tar.gz $jelbrek/
-                device_send_rdtar freeze5.tar data
+                device_send_rdtar freeze5.tar gz
                 rm $jelbrek/freeze5.tar.gz
             else
-                device_send_rdtar freeze.tar data
+                device_send_rdtar freeze.tar gz
             fi
 
             # extras extraction
             if [[ $ipsw_openssh == 1 ]]; then
                 device_send_rdtar sshdeb.tar
+                device_send_rdtar openssh.tar gz
+                device_send_rdtar openssl.tar gz
             fi
             case $vers in
                 [543]* ) device_send_rdtar cydiasubstrate.tar;;
             esac
             case $vers in
-                9* ) device_send_rdtar launchctl.tar;;
-                3* ) device_send_rdtar cydiahttpatch.tar;;
+                9.* ) device_send_rdtar launchctl.tar;;
+                3.* ) device_send_rdtar cydiahttpatch.tar;;
             esac
             case $vers in
-                [43]* ) :;;
+                [43].* ) :;;
                 * ) device_send_rdtar LukeZGD.tar;;
             esac
 
             # remove patcyh except for ios 8.3+ where it's required
             case $vers in
-                9* | 8.[43]* ) :;;
+                9.* | 8.[43]* ) :;;
                 * )
                     $ssh -p $ssh_port root@127.0.0.1 "cd /mnt1; rm Library/MobileSubstrate/DynamicLibraries/patcyh* private/lib/dpkg/info/com.saurik.patcyh* usr/lib/libpatcyh.dylib"
                     device_send_rdtar nopatcyh.tar
@@ -7542,15 +7599,13 @@ device_ramdisk() {
             esac
 
             # final setup for ios 8.x daibutsu, and/or reboot
-            if [[ $vers == "8"* && $ipsw_everuntether != 1 ]]; then # || [[ $vers == "7.1"* ]]; then # change to "7"* for lyncis 7.0.x
+            if [[ $vers == "8."* && $ipsw_everuntether != 1 ]] || [[ $vers == "7."* ]]; then
                 log "Sending daibutsu/move.sh"
                 $scp -P $ssh_port $jelbrek/daibutsu/move.sh root@127.0.0.1:/mnt1
                 log "Moving files"
                 $ssh -p $ssh_port root@127.0.0.1 "bash /mnt1/move.sh $vers; rm /mnt1/move.sh"
 
-                if [[ $vers == "7.1"* ]]; then # change to "7"* for lyncis 7.0.x. but this portion is unused anyway since ramdisk method is disabled for 7.x
-                    log "Symlinking lyncis"
-                    $ssh -p $ssh_port root@127.0.0.1 "mv -v /mnt1/usr/libexec/CrashHousekeeping /mnt1/usr/libexec/CrashHousekeeping.backup; ln -s /lyncis /mnt1/usr/libexec/CrashHousekeeping"
+                if [[ $vers == "7."* ]]; then
                     log "Rebooting"
                     $ssh -p $ssh_port root@127.0.0.1 "reboot_bak"
                 else
@@ -9150,15 +9205,17 @@ menu_ipa() {
             "Install IPA using Sideloader" )
                 device_sideloader
                 log "Checking for any existing certificates..."
-                $sideloader cert list
-                if [[ $? != 0 ]]; then
+                local temp=$(mktemp)
+                $sideloader cert list | tee /dev/tty > "$temp"
+                local check=${PIPESTATUS[0]}
+                local revoke=$(grep -m1 "serial number" "$temp" | sed -E 's/.*number `//' | cut -c -32 | tr -dc '[:alnum:]')
+                if [[ $check != 0 ]]; then
                     warn "Sideloader returned an error. Incorrect Apple ID credentials?"
                     pause
                     continue
                 fi
-                local revoke=$($sideloader cert list | grep -m1 "serial number" | sed -E 's/.*number `//' | cut -c -32 | tr -dc '[:alnum:]')
                 if [[ -n $revoke ]]; then
-                    log "Revoking existing certificate..."
+                    log "Revoking existing certificate: $revoke"
                     $sideloader cert revoke $revoke
                 fi
                 log "Installing IPA using Sideloader..."
@@ -10701,24 +10758,27 @@ menu_ipsw_browse() {
     local newpath
     local text="Target"
     local picker
+    local scan
 
     ipsw_latest_set
-    local menu_items=($(ls ../$(echo "$device_type" | tr '[:upper:]' '[:lower:]')*restore.ipsw 2>/dev/null))
-    menu_items+=($(ls ../$device_type*Restore.ipsw 2>/dev/null))
-    [[ $ipsw_prefix != "$device_type" ]] && menu_items+=($(ls ../${ipsw_prefix}_1*Restore.ipsw 2>/dev/null))
+    local menu_items=($(ls ../$device_type_lower*restore.ipsw $HOME/Downloads/$device_type_lower*restore.ipsw 2>/dev/null))
+    menu_items+=($(ls ../$device_type*Restore.ipsw $HOME/Downloads/$device_type*Restore.ipsw 2>/dev/null))
+    [[ $ipsw_prefix != "$device_type" ]] && menu_items+=($(ls ../${ipsw_prefix}_1*Restore.ipsw $HOME/Downloads/${ipsw_prefix}_1*Restore.ipsw 2>/dev/null))
     if [[ $1 == "base" ]]; then
         text="Base"
         menu_items=()
         case $device_proc in
-            4 ) menu_items=($(ls ../${device_type}_${device_base_vers}_${device_base_build}_Restore.ipsw 2>/dev/null));;
+            4 ) scan="${device_type}_${device_base_vers}_${device_base_build}_Restore.ipsw";;
             6 )
-                menu_items=($(ls ../$(echo "$device_type" | tr '[:upper:]' '[:lower:]')_7.*restore.ipsw 2>/dev/null))
-                menu_items+=($(ls ../${device_type}_7.*Restore.ipsw 2>/dev/null))
+                menu_items=($(ls ../${device_type_lower}_7.*restore.ipsw $HOME/Downloads/${device_type_lower}_7.*restore.ipsw 2>/dev/null))
+                scan="${device_type}_7.*Restore.ipsw"
             ;;
-            * ) menu_items=($(ls ../${device_type}_7.1*Restore.ipsw 2>/dev/null));;
+            * ) scan="${device_type}_7.1*Restore.ipsw";;
         esac
+        menu_items=($(ls ../$scan $HOME/Downloads/$scan 2>/dev/null))
     elif [[ $1 == "special" ]]; then
-        menu_items=($(ls ../${device_type_special}_${device_target_vers}_${device_target_build}_Restore.ipsw 2>/dev/null))
+        scan="${device_type_special}_${device_target_vers}_${device_target_build}_Restore.ipsw"
+        menu_items=($(ls ../$scan $HOME/Downloads/$scan 2>/dev/null))
     fi
     case $1 in
         "iOS 10.3.3"  ) versionc="10.3.3";;
@@ -10784,7 +10844,7 @@ menu_ipsw_browse() {
         log "For restoring to latest iOS, select the \"Latest iOS\" option instead of \"Other\""
         pause
         return
-    elif [[ $device_proc == 6 && $target_vers_maj == 10 && $device_target_other != 1 ]]; then
+    elif [[ $device_proc == 6 && $target_vers_maj == 10 && $device_target_other != 1 && $device_target_powder != 1 ]]; then
         log "Selected IPSW ($device_target_vers) is not supported as target version."
         print "* iOS 10 versions that are not 10.3.4 are not supported for 32-bit devices."
         print "* The only exception is for restoring with 32-bit iOS 10 blobs."
@@ -11510,11 +11570,7 @@ device_jailbreak_confirm() {
     fi
     log "Checking if your device and version is supported..."
     log "Please read the message below:"
-    if [[ $device_type == "iPad2"* && $device_vers == "4"* ]]; then
-        warn "For this version, it will be a semi-tethered jailbreak. checkm8-a5 is required to boot to a jailbroken state."
-        print "* To boot jailbroken later, go to: Main Menu -> Just Boot"
-        pause
-    elif [[ $device_type == "iPhone3,3" ]]; then
+    if [[ $device_type == "iPhone3,3" ]]; then
         case $device_vers in
             4.2.9 | 4.2.10 )
                 warn "For this version, it will be a semi-tethered jailbreak."
@@ -11541,7 +11597,7 @@ device_jailbreak_confirm() {
     fi
     if [[ $device_vers == "7"* ]]; then
         warn "Jailbreaking using the ramdisk method is disabled for iOS 7.x."
-        print "* It is recommended to use evasi0n7/Lyncis instead, or dump blobs and restore with the jailbreak option enabled."
+        print "* It is recommended to use Aquila instead, or dump blobs and restore with the jailbreak option enabled."
         warn "You will encounter issues when jailbreaking 7.x with ramdisk method, particularly baseband issues."
         [[ $ipsw_jailbreak != 1 ]] && warn "You can bypass this by enabling the jailbreak flag, but only do this if you know what you are doing."
         echo
@@ -11564,8 +11620,10 @@ device_jailbreak_confirm() {
     print "* For more details, go to: https://github.com/LukeZGD/Legacy-iOS-Kit/wiki/Jailbreaking"
     case $device_vers in
         7.0* )
-            print "* For this version, evasi0n7 on Windows/Mac can be used instead of this option."
-            print "* https://ios.cfw.guide/installing-evasi0n7/"
+            print "* For this version, Aquila on Windows/Mac can be used instead of this option."
+            print "* https://ios.cfw.guide/installing-aquila/"
+            print "* Sideloading EverPwnage is also an option, especially if on Linux."
+            print "* https://github.com/LukeZGD/EverPwnage"
             pause
             [[ $ipsw_jailbreak != 1 ]] && return
         ;;
@@ -11588,7 +11646,7 @@ device_jailbreak_confirm() {
         ;;
         10.* )
             print "* For this version, use socket to jailbreak your device."
-            print "* https://github.com/LukeZGD/socket"
+            print "* https://github.com/staturnzz/socket"
             pause
             return
         ;;
@@ -12411,8 +12469,8 @@ device_enter_ramdisk() {
     fi
 
     if [[ $1 == "menu" ]]; then
-        clear
-        device_iproxy
+        [[ $debug_mode != 1 ]] && clear
+        device_iproxy no-logging
         device_sshpass alpine
         menu_ramdisk
         return
@@ -12736,6 +12794,11 @@ device_fourthree_step3() {
     if [[ $ipsw_openssh == 1 ]]; then
         log "Installing OpenSSH"
         cat $jelbrek/sshdeb.tar | $ssh -p $ssh_port root@127.0.0.1 "tar -xvf - -C /mnt1"
+        cp $jelbrek/openssh.tar.gz $jelbrek/openssl.tar.gz .
+        gzip -d openssh.tar.gz
+        gzip -d openssl.tar.gz
+        cat openssh.tar | $ssh -p $ssh_port root@127.0.0.1 "tar -xf - -C /mnt1"
+        cat openssl.tar | $ssh -p $ssh_port root@127.0.0.1 "tar -xf - -C /mnt1"
     fi
     log "Unmounting filesystems"
     $ssh -p $ssh_port root@127.0.0.1 "umount /mnt1/private/var; umount /mnt1"
@@ -13068,18 +13131,21 @@ fi
 trap "clean" EXIT
 trap "exit 1" INT TERM
 
-clean
-
 othertmp=$(ls "$(dirname "$0")" | grep -c tmp)
 if [[ $othertmp != 0 ]]; then
+    noclean=1
     log "Detected existing tmp folder(s)."
     print "* There might be other Legacy iOS Kit instance(s) running, or residual tmp folder(s) not deleted."
     print "* Running multiple instances is not fully supported and can cause unexpected behavior."
     print "* It is recommended to only use a single instance and/or delete all existing \"tmp\" folders in your Legacy iOS Kit folder before continuing."
     select_yesno "Select Y to remove all tmp folders, N to run as is" 1
     if [[ $? == 1 ]]; then
+        noclean=
         rm -r "$(dirname "$0")/tmp"*
+        clean
     fi
+else
+    clean
 fi
 othertmp=$(ls "$(dirname "$0")" | grep -c tmp)
 
