@@ -7052,7 +7052,10 @@ device_ramdisk64() {
 }
 
 device_ramdisk() {
-    local comps=("iBSS" "iBEC" "DeviceTree" "Kernelcache")
+    local comps=("iBSS" "iBEC" "DeviceTree")
+    if [[ -z "$custom_kernelcache_path" ]]; then
+        comps+=("Kernelcache")
+    fi
     local name
     local iv
     local key
@@ -7166,10 +7169,12 @@ device_ramdisk() {
         "$dir/xpwntool" Ramdisk.patched Ramdisk.dmg -t RestoreRamdisk.dec
         log "Patch iBSS"
         $bspatch iBSS.orig iBSS ../resources/patch/iBSS.${device_model}ap.RELEASE.patch
-        log "Patch Kernelcache"
-        mv Kernelcache.dec Kernelcache0.dec
-        $bspatch Kernelcache0.dec Kernelcache.patched ../resources/patch/kernelcache.release.s5l8900x.patch
-        "$dir/xpwntool" Kernelcache.patched Kernelcache.dec -t Kernelcache.orig $decrypt
+        if [[ -z "$custom_kernelcache_path" ]]; then
+            log "Patch Kernelcache"
+            mv Kernelcache.dec Kernelcache0.dec
+            $bspatch Kernelcache0.dec Kernelcache.patched ../resources/patch/kernelcache.release.s5l8900x.patch
+            "$dir/xpwntool" Kernelcache.patched Kernelcache.dec -t Kernelcache.orig $decrypt
+        fi
         rm DeviceTree.dec
         mv DeviceTree.orig DeviceTree.dec
     elif [[ $device_type == "iPod2,1" ]]; then
@@ -7178,10 +7183,12 @@ device_ramdisk() {
         log "Patch iBSS"
         $bspatch iBSS.dec iBSS.patched ../resources/patch/iBSS.${device_model}ap.RELEASE.patch
         "$dir/xpwntool" iBSS.patched iBSS -t iBSS.orig
-        log "Patch Kernelcache"
-        mv Kernelcache.dec Kernelcache0.dec
-        $bspatch Kernelcache0.dec Kernelcache.patched ../resources/patch/kernelcache.release.${device_model}.patch
-        "$dir/xpwntool" Kernelcache.patched Kernelcache.dec -t Kernelcache.orig $decrypt
+        if [[ -z "$custom_kernelcache_path" ]]; then
+            log "Patch Kernelcache"
+            mv Kernelcache.dec Kernelcache0.dec
+            $bspatch Kernelcache0.dec Kernelcache.patched ../resources/patch/kernelcache.release.${device_model}.patch
+            "$dir/xpwntool" Kernelcache.patched Kernelcache.dec -t Kernelcache.orig $decrypt
+        fi
         rm DeviceTree.dec
         mv DeviceTree.orig DeviceTree.dec
     else
@@ -7232,14 +7239,24 @@ device_ramdisk() {
     fi
 
     if [[ $device_boot4 == 1 ]]; then
-        log "Patch Kernelcache"
-        mv Kernelcache.dec Kernelcache0.dec
-        "$dir/xpwntool" Kernelcache0.dec Kernelcache.raw
-        $bspatch Kernelcache.raw Kernelcache.patched ../resources/patch/kernelcache.release.${device_model}.${build_id}.patch
-        "$dir/xpwntool" Kernelcache.patched Kernelcache.dec -t Kernelcache0.dec
+        if [[ -z "$custom_kernelcache_path" ]]; then
+            log "Patch Kernelcache"
+            mv Kernelcache.dec Kernelcache0.dec
+            "$dir/xpwntool" Kernelcache0.dec Kernelcache.raw
+            $bspatch Kernelcache.raw Kernelcache.patched ../resources/patch/kernelcache.release.${device_model}.${build_id}.patch
+            "$dir/xpwntool" Kernelcache.patched Kernelcache.dec -t Kernelcache0.dec
+        fi
     fi
 
-    mv iBSS iBEC DeviceTree.dec Kernelcache.dec Ramdisk.dmg $ramdisk_path 2>/dev/null
+    # Explicitly move/copy the correct Kernelcache to the staging folder
+    if [[ -n "$custom_kernelcache_path" ]]; then
+        log "Staging custom Kernelcache: $custom_kernelcache_path"
+        cp "$custom_kernelcache_path" "$ramdisk_path/Kernelcache.dec"
+    else
+        mv Kernelcache.dec "$ramdisk_path" 2>/dev/null
+    fi
+
+    mv iBSS iBEC DeviceTree.dec Ramdisk.dmg "$ramdisk_path" 2>/dev/null
 
     if [[ $device_argmode == "none" ]]; then
         log "Done creating SSH ramdisk files: saved/$device_type/ramdisk_$build_id"
@@ -7287,8 +7304,13 @@ device_ramdisk() {
     $irecovery -f $ramdisk_path/DeviceTree.dec
     log "Running devicetree"
     $irecovery -c devicetree
-    log "Sending KernelCache..."
-    $irecovery -f $ramdisk_path/Kernelcache.dec
+    
+    if [[ -n "$custom_kernelcache_path" ]]; then
+        log "Sending Custom KernelCache..."
+    else
+        log "Sending KernelCache..."
+    fi
+    $irecovery -f "$ramdisk_path/Kernelcache.dec"
     $irecovery -c bootx
 
     if [[ $1 == "justboot" ]]; then
@@ -12078,6 +12100,9 @@ menu_justboot() {
     local back
     local vers
     local recent="../saved/$device_type/justboot_${device_ecid}"
+    
+    # Reset custom kernelcache on entry
+    custom_kernelcache_path=""
 
     # Store original device info to prevent it from being overwritten
     local original_device_type="$device_type"
@@ -12107,7 +12132,7 @@ menu_justboot() {
         elif [[ $total_history_count -gt 0 ]]; then
             menu_items+=("Boot History (All Devices)")
         fi
-        menu_items+=("Custom Bootargs")
+        menu_items+=("Custom Bootargs" "Select Custom Kernelcache")
         if [[ $device_type == "iPod4,1" ]]; then
             menu_items+=("(*) iOS 7.1.2")
         fi
@@ -12134,6 +12159,10 @@ menu_justboot() {
         else
             print "* You may enter custom bootargs (optional, experimental option)"
             print "* Default Bootargs: pio-error=0 -v amfi=0xff cs_enforcement_disable=1"
+        fi
+        
+        if [[ -n $custom_kernelcache_path ]]; then
+            print "* Custom Kernelcache: $(basename "$custom_kernelcache_path")"
         fi
         echo
         input "Select an option:"
@@ -12184,6 +12213,12 @@ menu_justboot() {
                 mode="device_justboot_ios7touch4"
             ;;
             "Custom Bootargs" ) read -p "$(input 'Enter custom bootargs: ')" device_bootargs;;
+            "Select Custom Kernelcache" )
+                select_custom_file "Select your Custom Kernelcache file:" "*.img3"
+                if [[ -n "$selected_custom_file" ]]; then
+                    custom_kernelcache_path="$selected_custom_file"
+                fi
+            ;;
             "Go Back" ) back=1;;
         esac
     done
