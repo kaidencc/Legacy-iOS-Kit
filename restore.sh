@@ -6836,33 +6836,21 @@ menu_remove4() {
     while [[ -z "$mode" && -z "$back" ]]; do
         menu_items=("Disable Exploit" "Enable Exploit")
         
-        # Add Custom Firmware toggle for iPad 1
+        # Add Advanced Options for iPad 1
         if [[ $device_type == "iPad1,1" ]]; then
-            local custom_status="OFF"
-            [[ $use_premade_custom == 1 ]] && custom_status="ON"
-            menu_items+=("Custom Firmware [$custom_status]")
+            menu_items+=("Advanced Options")
         fi
         
         menu_items+=("Go Back")
         menu_print_info
         print " > Main Menu > Useful Utilities > Disable/Enable Exploit"
-        
-        if [[ $use_premade_custom == 1 && $device_type == "iPad1,1" ]]; then
-            print "* Custom Firmware Mode Enabled."
-            print "* Will use iBoot3_$device_ecid from the 'custom' folder."
-        fi
 
         input "Select an option:"
         select_option "${menu_items[@]}"
         selected="${menu_items[$?]}"
         
-        # Handle Toggle
-        if [[ $selected == "Custom Firmware"* ]]; then
-            if [[ $use_premade_custom == 1 ]]; then
-                use_premade_custom=0
-            else
-                use_premade_custom=1
-            fi
+        if [[ $selected == "Advanced Options" ]]; then
+            menu_advanced_options "remove4"
             continue
         fi
 
@@ -9983,7 +9971,7 @@ menu_ipsw_appleinternal() {
             "Select AppleInternal DMG" ) menu_dmg_browse;;
             "Select Apple Logo" ) menu_logo_browse "boot";;
             "Select Recovery Logo" ) menu_logo_browse "recovery";;
-            "Advanced Options" ) menu_advanced_options;;
+            "Advanced Options" ) menu_advanced_options "powdersn0w_create";;
             "(*) Create AppleInternal IPSW" ) 
                 mode="custom-ipsw"
             ;;
@@ -10005,26 +9993,56 @@ menu_ipsw_appleinternal() {
 }
 
 menu_advanced_options() {
+    local ctx="$1"
     local menu_items
     local selected
     local back
 
     while [[ -z "$mode" && -z "$back" ]]; do
-        menu_items=("Select Custom Kernelcache")
-        if [[ -n $custom_kernelcache_path ]]; then
-            menu_items+=("Clear Custom Kernelcache")
+        menu_items=()
+
+        # Custom Firmware Toggle Logic (Show on restores and remove4)
+        if [[ $ctx == *"_restore" || $ctx == "remove4" ]]; then
+            local custom_status="OFF"
+            [[ $use_premade_custom == 1 ]] && custom_status="ON"
+            menu_items+=("Custom Firmware [$custom_status]")
         fi
+
+        # Custom Kernelcache Logic (Show on powdersn0w and justboot)
+        if [[ $ctx == "powdersn0w"* || $ctx == "justboot" ]]; then
+            menu_items+=("Select Custom Kernelcache")
+            if [[ -n $custom_kernelcache_path ]]; then
+                menu_items+=("Clear Custom Kernelcache")
+            fi
+        fi
+
         menu_items+=("Go Back")
 
         menu_print_info
         print " > ... > Advanced Options"
         echo
-        if [[ -n $custom_kernelcache_path ]]; then
-            print "* Custom Kernelcache: $(basename "$custom_kernelcache_path")"
-        else
-            print "* Custom Kernelcache: [Not Selected]"
+
+        # Info Displays
+        if [[ $ctx == *"_restore" || $ctx == "remove4" ]]; then
+            if [[ $use_premade_custom == 1 ]]; then
+                print "* Custom Firmware Mode: ON"
+                print "* The script will NOT create an IPSW. It will look for existing files in the 'custom' folder."
+                if [[ $ctx == "remove4" ]]; then
+                    print "* Will use iBoot3_$device_ecid from the 'custom' folder."
+                fi
+            fi
         fi
-        print "* Note: This replaces the filesystem kernelcache (not the restore kernelcache)."
+
+        if [[ $ctx == "powdersn0w"* || $ctx == "justboot" ]]; then
+            if [[ -n $custom_kernelcache_path ]]; then
+                print "* Custom Kernelcache: $(basename "$custom_kernelcache_path")"
+            else
+                print "* Custom Kernelcache: [Not Selected]"
+            fi
+            if [[ $ctx == "powdersn0w"* ]]; then
+                print "* Note: This replaces the filesystem kernelcache (not the restore kernelcache)."
+            fi
+        fi
         echo
 
         input "Select an option:"
@@ -10032,6 +10050,13 @@ menu_advanced_options() {
         selected="${menu_items[$?]}"
 
         case $selected in
+            "Custom Firmware"* )
+                if [[ $use_premade_custom == 1 ]]; then
+                    use_premade_custom=0
+                else
+                    use_premade_custom=1
+                fi
+            ;;
             "Select Custom Kernelcache" )
                 menu_kernelcache_browse
             ;;
@@ -10444,20 +10469,13 @@ menu_ipsw() {
             fi
         fi
         
-        # Add Custom Firmware toggle here
-        if [[ ($1 == *"powdersn0w"* || $1 == *"Tethered"*) && $2 != "ipsw" ]]; then
-            local custom_status="OFF"
-            [[ $use_premade_custom == 1 ]] && custom_status="ON"
-            menu_items+=("Custom Firmware [$custom_status]")
-        fi
-
         # AppleInternal Menu Option
         if [[ $1 == *"powdersn0w"* || $1 == *"Tethered"* ]]; then
             menu_items+=("AppleInternal")
         fi
         
-        # Advanced Options Menu (powdersn0w only)
-        if [[ $1 == *"powdersn0w"* ]]; then
+        # Advanced Options Menu (powdersn0w creation, or ANY powdersn0w/tethered restore)
+        if [[ $1 == *"powdersn0w"* ]] || [[ $1 == *"Tethered"* && $2 != "ipsw" ]]; then
             menu_items+=("Advanced Options")
         fi
 
@@ -10495,16 +10513,6 @@ menu_ipsw() {
         case $selected in
             "(*) Create IPSW" ) mode="custom-ipsw";;
             "$start" ) mode="downgrade";;
-            "Custom Firmware"* )
-                if [[ $use_premade_custom == 1 ]]; then
-                    use_premade_custom=0
-                else
-                    use_premade_custom=1
-                    print "* Custom Firmware Mode Enabled."
-                    print "* The script will NOT create an IPSW. It will look for existing files in the 'custom' folder."
-                    print "* You must still select the STOCK IPSW files in the next steps for verification purposes."
-                fi
-            ;;
             "(*) Start Update" )
                 print "* The \"Start Update\" will perform an update to your device without clearing device data."
                 print "* One usage of this is to carry over activation records to the latest iOS version."
@@ -10541,7 +10549,10 @@ menu_ipsw() {
                 fi
             ;;
             "Advanced Options" )
-                menu_advanced_options
+                local adv_ctx="tethered"
+                [[ $1 == *"powdersn0w"* ]] && adv_ctx="powdersn0w"
+                [[ $2 == "ipsw" ]] && adv_ctx="${adv_ctx}_create" || adv_ctx="${adv_ctx}_restore"
+                menu_advanced_options "$adv_ctx"
             ;;
             "Go Back" )
                 back=1
@@ -12289,7 +12300,7 @@ menu_justboot() {
         elif [[ $total_history_count -gt 0 ]]; then
             menu_items+=("Boot History (All Devices)")
         fi
-        menu_items+=("Custom Bootargs" "Select Custom Kernelcache")
+        menu_items+=("Custom Bootargs" "Advanced Options")
         if [[ $device_type == "iPod4,1" ]]; then
             menu_items+=("(*) iOS 7.1.2")
         fi
@@ -12318,9 +12329,6 @@ menu_justboot() {
             print "* Default Bootargs: pio-error=0 -v amfi=0xff cs_enforcement_disable=1"
         fi
         
-        if [[ -n $custom_kernelcache_path ]]; then
-            print "* Custom Kernelcache: $(basename "$custom_kernelcache_path")"
-        fi
         echo
         input "Select an option:"
         select_option "${menu_items[@]}"
@@ -12370,9 +12378,7 @@ menu_justboot() {
                 mode="device_justboot_ios7touch4"
             ;;
             "Custom Bootargs" ) read -p "$(input 'Enter custom bootargs: ')" device_bootargs;;
-            "Select Custom Kernelcache" )
-                menu_kernelcache_browse
-            ;;
+            "Advanced Options" ) menu_advanced_options "justboot";;
             "Go Back" ) back=1;;
         esac
     done
