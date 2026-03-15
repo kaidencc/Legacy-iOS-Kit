@@ -108,6 +108,7 @@ clean_usbmuxd() {
 display_help() {
     echo ' *** Legacy iOS Kit ***
   - Script by LukeZGD -
+  - Fork by kaiden.cc -
 
 Usage: ./restore.sh [Options]
 
@@ -8243,6 +8244,7 @@ menu_print_info() {
     fi
     print " *** Legacy iOS Kit ***"
     print " - Script by LukeZGD -"
+    print " - Fork by kaiden.cc -"
     echo
     if [[ -n $version_current ]]; then
         print "* Version: $version_current ($git_hash)"
@@ -8444,7 +8446,10 @@ dumper_convert_tar() {
     fi
 
     local STRIP_VAL=0
-    if [[ "$SAMPLE" == */* ]]; then
+    local TOP_LEVEL_DIRS=$(tar -tf "$SELECTED_TAR" 2>/dev/null | awk -F'/' '{print $1}' | sort -u)
+    local DIR_COUNT=$(echo "$TOP_LEVEL_DIRS" | wc -l | tr -d ' ')
+
+    if [[ "$DIR_COUNT" -eq 1 && "$TOP_LEVEL_DIRS" == "mnt1" ]]; then
         STRIP_VAL=1
         log "Leading folder detected (mnt1), auto-stripping enabled"
     fi
@@ -9752,63 +9757,347 @@ ipsw_hwmodel_set() {
     ipsw_hwmodel="$hwmodel"
 }
 
-menu_dmg_browse() {
-    local newpath
-    input "Select your AppleInternal DMG file in the file selection window."
-    menu_zenity_check
-    newpath="$($zenity --file-selection --file-filter='DMG | *.dmg' --title="Select AppleInternal DMG")"
-    [[ ! -s "$newpath" ]] && read -p "$(input "Enter path to DMG file (or press Enter/Return or Ctrl+C to cancel): ")" newpath
+menu_dmg_downloader() {
+    rm -f tmp_ai.json tmp_ai.json.gz
     
-    if [[ -s "$newpath" ]]; then
-        appleinternal_dmg_path="$newpath"
-        log "Selected DMG: $appleinternal_dmg_path"
-        
-        # 1. Calculate partition size
-        if [[ -f "../bin/dmg_plist.py" ]]; then
-            log "Calculating partition size..."
-            appleinternal_part_size=$(python3 ../bin/dmg_plist.py "$appleinternal_dmg_path")
-            if [[ "$appleinternal_part_size" =~ ^[0-9]+$ ]]; then
-                log "Calculated SystemPartitionSize: $appleinternal_part_size"
-            else
-                error "Failed to calculate partition size. Output: $appleinternal_part_size"
-            fi
-        else
-            error "dmg_plist.py not found in ../bin/"
-        fi
-
-        # 2. Extract ProductBuildVersion from DMG
-        log "Extracting Build ID from DMG..."
-        rm -f tmp_ai_ver.plist
-        
-        # Use bundled 7zz directly from the platform's binary directory
-        if [[ -x "$dir/7zz" ]]; then
-            "$dir/7zz" e "$appleinternal_dmg_path" "*System/Library/CoreServices/SystemVersion.plist" -r -y >/dev/null 2>&1
-            if [[ -s "SystemVersion.plist" ]]; then
-                mv SystemVersion.plist tmp_ai_ver.plist
-            fi
-        else
-            error "7zz binary not found or not executable in $dir."
-        fi
-        
-        if [[ ! -s tmp_ai_ver.plist ]]; then
-            error "Failed to read SystemVersion.plist from AppleInternal DMG." "* Ensure the DMG is a valid iOS Restore/RootFS image."
-        fi
-
-        # Parse Build Version
-        if [[ $platform == "macos" ]]; then
-            appleinternal_build_id=$(plutil -extract 'ProductBuildVersion' xml1 tmp_ai_ver.plist -o - | sed -ne '/<string>/,/<\/string>/p' | sed -e "s/<string>//" | sed "s/<\/string>//" | sed '2d')
-        else
-            appleinternal_build_id=$(grep -A1 "ProductBuildVersion" tmp_ai_ver.plist | grep -oPm1 "(?<=<string>)[^<]+")
-        fi
-        
-        # Force remove the temp file
-        rm -f tmp_ai_ver.plist
-        
-        if [[ -z $appleinternal_build_id ]]; then
-            error "Could not determine ProductBuildVersion from DMG."
-        fi
-        log "Detected Internal Build ID: $appleinternal_build_id"
+    if [[ -s "../resources/ai_dmgs.dat" ]]; then
+        log "Reading local ai_dmgs.dat..."
+        cp "../resources/ai_dmgs.dat" tmp_ai.json.gz
+        gzip -d -f tmp_ai.json.gz
+    else
+        error "ai_dmgs.dat not found in resources folder."
     fi
+    
+    if [[ ! -s tmp_ai.json ]]; then
+        error "Failed to decompress DMG list. Ensure it is a valid gzipped JSON."
+    fi
+    
+    local len=$($jq '. | length' tmp_ai.json 2>/dev/null)
+    if [[ -z $len || $len == 0 ]]; then
+        error "No DMGs found in the list, or JSON format is invalid."
+    fi
+    
+    while true; do
+        local menu_items=()
+        local i=0
+        while (( i < len )); do
+            local bname=$($jq -r ".[$i].buildName" tmp_ai.json)
+            local bnum=$($jq -r ".[$i].buildNumber" tmp_ai.json)
+            
+            local item_str="$bnum"
+            if [[ "$bname" != "null" && -n "$bname" ]]; then
+                item_str="$bname $bnum"
+            fi
+            menu_items+=("$item_str")
+            ((i++))
+        done
+        menu_items+=("Go Back")
+        
+        menu_print_info
+        print " > ... > AppleInternal > Download AppleInternal DMG"
+        echo
+        input "Select a build to download:"
+        select_option "${menu_items[@]}"
+        local sel=$?
+        local selected="${menu_items[$sel]}"
+        
+        if [[ "$selected" == "Go Back" ]]; then
+            rm -f tmp_ai.json
+            break
+        fi
+        
+        menu_dmg_downloader_item "$sel"
+    done
+}
+
+menu_dmg_downloader_item() {
+    local idx=$1
+    local bname=$($jq -r ".[$idx].buildName" tmp_ai.json)
+    local bnum=$($jq -r ".[$idx].buildNumber" tmp_ai.json)
+    local btype=$($jq -r ".[$idx].buildType" tmp_ai.json)
+    local desc=$($jq -r ".[$idx].description" tmp_ai.json)
+    local dev=$($jq -r ".[$idx].device" tmp_ai.json)
+    local base_ver=$($jq -r ".[$idx].baseVersion" tmp_ai.json)
+    local link_rev=$($jq -r ".[$idx].link" tmp_ai.json)
+    local threads=$($jq -r ".[$idx].threads" tmp_ai.json)
+    local comp=$($jq -r ".[$idx].compression" tmp_ai.json)
+    local is_udzo=$($jq -r ".[$idx].udzo" tmp_ai.json)
+    
+    local display_name="$bnum"
+    [[ "$bname" != "null" && -n "$bname" ]] && display_name="$bname $bnum"
+    
+    while true; do
+        local menu_items=("(*) Start Download")
+        [[ "$desc" != "null" && -n "$desc" ]] && menu_items+=("View Description")
+        menu_items+=("Go Back")
+        
+        menu_print_info
+        print " > ... > Download AppleInternal DMG > $display_name"
+        echo
+        print "* Target Device: ${dev:-Unknown}"
+        print "* Base Version:  ${base_ver:-Unknown}"
+        if [[ "$btype" != "null" && -n "$btype" ]]; then
+            print "* Build Type:    $btype"
+        fi
+        if [[ "$comp" != "null" && -n "$comp" ]]; then
+            print "* Compression:   $comp"
+        fi
+        if [[ "$is_udzo" == "false" ]]; then
+            print "* Format:        Raw (Will be converted to UDZO)"
+        fi
+        echo
+        
+        input "Select an option:"
+        select_option "${menu_items[@]}"
+        local selected="${menu_items[$?]}"
+        
+        case "$selected" in
+            "(*) Start Download" )
+                # Construct final output filename
+                local out_name="AppleInternal_${bnum}.dmg"
+                [[ "$bname" != "null" && -n "$bname" ]] && out_name="${bname// /_}_${bnum}.dmg"
+                
+                # Check if file already exists
+                if [[ -s "../$out_name" ]]; then
+                    log "File $out_name already exists in the root folder."
+                    print "* Skipping download."
+                    pause
+                    break # Go back to downloader list
+                fi
+                
+                # Decode link: reverse string then base64 decode
+                local link=""
+                if [[ $platform == "macos" ]]; then
+                    link=$(echo "$link_rev" | rev | base64 --decode)
+                else
+                    link=$(echo "$link_rev" | rev | base64 -d)
+                fi
+                
+                if [[ -z "$link" ]]; then
+                    error "Failed to decode download link."
+                fi
+                
+                # Determine extension and decompression parameters
+                local ext=""
+                local decompress_cmd=""
+                local is_tar=0
+                local is_zstd_tar=0
+                
+                case "$comp" in
+                    "gzip" | "gz" ) ext=".gz"; decompress_cmd="gzip -d" ;;
+                    "xz" ) ext=".xz"; decompress_cmd="xz -d" ;;
+                    "bzip2" | "bz2" ) ext=".bz2"; decompress_cmd="bzip2 -d" ;;
+                    "zstd" | "zst" ) ext=".zst"; decompress_cmd="zstd -d --rm" ;;
+                    "zip" ) ext=".zip" ;;
+                    "tar" ) ext=".tar"; is_tar=1 ;;
+                    "tar.gz" | "tgz" ) ext=".tar.gz"; is_tar=1 ;;
+                    "tar.xz" | "txz" ) ext=".tar.xz"; is_tar=1 ;;
+                    "tar.bz2" | "tbz2" ) ext=".tar.bz2"; is_tar=1 ;;
+                    "tar.zst" | "tzst" ) ext=".tar.zst"; is_tar=1; is_zstd_tar=1 ;;
+                    "null" | "" ) ext="" ;;
+                    * ) warn "Unknown compression type: $comp. Assuming no compression."; ext="" ;;
+                esac
+                
+                local dl_name="${out_name}${ext}"
+                
+                log "Starting download: $dl_name"
+                log "Using $threads threads..."
+                
+                # Download directly to the root folder (../)
+                $aria2c -s"$threads" -x"$threads" -j"$threads" -o "../$dl_name" "$link"
+                
+                if [[ -s "../$dl_name" ]]; then
+                    # --- TAR ARCHIVE HANDLING ---
+                    if [[ $is_tar == 1 ]]; then
+                        log "Extracting DMG from tar archive..."
+                        local extracted_dmg=""
+                        
+                        # Find the DMG inside the tar (handles nested folders too)
+                        if [[ $is_zstd_tar == 1 ]]; then
+                            extracted_dmg=$(zstd -cd "../$dl_name" 2>/dev/null | tar -tf - 2>/dev/null | grep -i '\.dmg$' | head -n 1)
+                        else
+                            extracted_dmg=$(tar -tf "../$dl_name" 2>/dev/null | grep -i '\.dmg$' | head -n 1)
+                        fi
+                        
+                        if [[ -n "$extracted_dmg" ]]; then
+                            # Extract ONLY the found DMG file
+                            if [[ $is_zstd_tar == 1 ]]; then
+                                zstd -cd "../$dl_name" | tar -xf - -C "../" "$extracted_dmg"
+                            else
+                                tar -xf "../$dl_name" -C "../" "$extracted_dmg"
+                            fi
+                            
+                            # Rename it to our standardized output name
+                            if [[ $? == 0 && -s "../$extracted_dmg" ]]; then
+                                mv "../$extracted_dmg" "../$out_name"
+                                rm -f "../$dl_name"
+                                
+                                # Clean up empty nested folder if tar contained one
+                                if [[ "$extracted_dmg" == */* ]]; then
+                                    local top_folder=$(echo "$extracted_dmg" | cut -d'/' -f1)
+                                    rmdir "../$top_folder" 2>/dev/null
+                                fi
+                            else
+                                error "Tar extraction failed."
+                            fi
+                        else
+                            error "No DMG file found inside the tar archive."
+                        fi
+
+                    # --- ZIP ARCHIVE HANDLING ---
+                    elif [[ "$ext" == ".zip" ]]; then
+                        log "Extracting DMG from zip archive..."
+                        local extracted_zip_dmg=$(unzip -Z1 "../$dl_name" | grep -i '\.dmg$' | head -n 1)
+                        
+                        if [[ -n "$extracted_zip_dmg" ]]; then
+                            # -j flattens directories, so it extracts directly to ../
+                            unzip -j -o "../$dl_name" "$extracted_zip_dmg" -d "../" >/dev/null
+                            local base_zip_dmg=$(basename "$extracted_zip_dmg")
+                            
+                            if [[ -s "../$base_zip_dmg" ]]; then
+                                [[ "$base_zip_dmg" != "$out_name" ]] && mv "../$base_zip_dmg" "../$out_name"
+                                rm -f "../$dl_name"
+                            else
+                                error "Zip extraction failed."
+                            fi
+                        else
+                            error "No DMG file found inside the zip archive."
+                        fi
+
+                    # --- SINGLE FILE COMPRESSION HANDLING (.gz, .xz, etc) ---
+                    elif [[ -n "$decompress_cmd" ]]; then
+                        log "Decompressing $dl_name..."
+                        $decompress_cmd "../$dl_name"
+                        
+                        if [[ $? != 0 || ! -s "../$out_name" ]]; then
+                            error "Decompression failed. You may need to extract it manually."
+                        fi
+                    fi
+                    
+                    # --- UDZO CONVERSION ---
+                    if [[ "$is_udzo" == "false" ]]; then
+                        log "Image is not UDZO compressed. Converting to UDZO..."
+                        "$dir/dmg" build "../$out_name" "../${out_name}_udzo.dmg"
+                        if [[ $? == 0 && -s "../${out_name}_udzo.dmg" ]]; then
+                            mv -f "../${out_name}_udzo.dmg" "../$out_name"
+                            log "Conversion to UDZO complete."
+                        else
+                            error "Failed to compress DMG to UDZO format."
+                        fi
+                    fi
+                    
+                    log "Download and extraction complete! Saved to root folder as: $out_name"
+                    pause
+                    break # Go back to downloader list
+                else
+                    error "Download failed."
+                fi
+            ;;
+            "View Description" )
+                echo
+                print "--- Description ---"
+                print "$desc"
+                print "-------------------"
+                pause
+            ;;
+            "Go Back" )
+                break
+            ;;
+        esac
+    done
+}
+
+menu_dmg_browse() {
+    local newpath=""
+    
+    if [[ -s "../resources/ai_dmgs.dat" ]]; then
+        # Downloader mode is active: use text-based list from root folder
+        local menu_items=()
+        local files=($(ls ../*.dmg 2>/dev/null))
+        
+        if [[ ${#files[@]} -eq 0 ]]; then
+            warn "No DMG files found in the Legacy-iOS-Kit root folder."
+            print "* Please place your AppleInternal DMG in the root folder, or use the Downloader."
+            pause
+            return
+        fi
+        
+        for f in "${files[@]}"; do
+            menu_items+=("$(basename "$f")")
+        done
+        menu_items+=("Go Back")
+        
+        menu_print_info
+        print " > ... > Select AppleInternal DMG"
+        echo
+        input "Select your AppleInternal DMG file:"
+        select_option "${menu_items[@]}"
+        local sel="${menu_items[$?]}"
+        
+        if [[ "$sel" == "Go Back" ]]; then
+            return
+        fi
+        newpath="../$sel"
+    else
+        # Downloader mode is disabled: use GUI file picker
+        input "Select your AppleInternal DMG file in the file selection window."
+        menu_zenity_check
+        newpath="$($zenity --file-selection --file-filter='DMG | *.dmg' --title="Select AppleInternal DMG")"
+        [[ ! -s "$newpath" ]] && read -p "$(input "Enter path to DMG file (or press Enter/Return or Ctrl+C to cancel): ")" newpath
+        
+        if [[ ! -s "$newpath" ]]; then
+            return
+        fi
+    fi
+    
+    appleinternal_dmg_path="$newpath"
+    log "Selected DMG: $appleinternal_dmg_path"
+    
+    # 1. Calculate partition size
+    if [[ -f "../bin/dmg_plist.py" ]]; then
+        log "Calculating partition size..."
+        appleinternal_part_size=$(python3 ../bin/dmg_plist.py "$appleinternal_dmg_path")
+        if [[ "$appleinternal_part_size" =~ ^[0-9]+$ ]]; then
+            log "Calculated SystemPartitionSize: $appleinternal_part_size"
+        else
+            error "Failed to calculate partition size. Output: $appleinternal_part_size"
+        fi
+    else
+        error "dmg_plist.py not found in ../bin/"
+    fi
+
+    # 2. Extract ProductBuildVersion from DMG
+    log "Extracting Build ID from DMG..."
+    rm -f tmp_ai_ver.plist
+    
+    # Use bundled 7zz directly from the platform's binary directory
+    if [[ -x "$dir/7zz" ]]; then
+        "$dir/7zz" e "$appleinternal_dmg_path" "*System/Library/CoreServices/SystemVersion.plist" -r -y >/dev/null 2>&1
+        if [[ -s "SystemVersion.plist" ]]; then
+            mv SystemVersion.plist tmp_ai_ver.plist
+        fi
+    else
+        error "7zz binary not found or not executable in $dir."
+    fi
+    
+    if [[ ! -s tmp_ai_ver.plist ]]; then
+        error "Failed to read SystemVersion.plist from AppleInternal DMG." "* Ensure the DMG is a valid iOS Restore/RootFS image."
+    fi
+
+    # Parse Build Version
+    if [[ $platform == "macos" ]]; then
+        appleinternal_build_id=$(plutil -extract 'ProductBuildVersion' xml1 tmp_ai_ver.plist -o - | sed -ne '/<string>/,/<\/string>/p' | sed -e "s/<string>//" | sed "s/<\/string>//" | sed '2d')
+    else
+        appleinternal_build_id=$(grep -A1 "ProductBuildVersion" tmp_ai_ver.plist | grep -oPm1 "(?<=<string>)[^<]+")
+    fi
+    
+    # Force remove the temp file
+    rm -f tmp_ai_ver.plist
+    
+    if [[ -z $appleinternal_build_id ]]; then
+        error "Could not determine ProductBuildVersion from DMG."
+    fi
+    log "Detected Internal Build ID: $appleinternal_build_id"
 }
 
 menu_ipsw_appleinternal() {
@@ -9861,6 +10150,10 @@ menu_ipsw_appleinternal() {
             menu_items+=("Select Base IPSW (Stock)")
         fi
         
+        # Only show the Downloader if the dat file actually exists in resources
+        if [[ -s "../resources/ai_dmgs.dat" ]]; then
+            menu_items+=("Download AppleInternal DMG")
+        fi
         menu_items+=("Select AppleInternal DMG")
         
         # Add Logo Options if supported
@@ -9968,6 +10261,7 @@ menu_ipsw_appleinternal() {
         case $selected in
             "Select Target IPSW (Stock)" ) menu_ipsw_browse "";;
             "Select Base IPSW (Stock)" ) menu_ipsw_browse "base";;
+            "Download AppleInternal DMG" ) menu_dmg_downloader;;
             "Select AppleInternal DMG" ) menu_dmg_browse;;
             "Select Apple Logo" ) menu_logo_browse "boot";;
             "Select Recovery Logo" ) menu_logo_browse "recovery";;
@@ -13023,6 +13317,7 @@ main() {
     fi
     print " *** Legacy iOS Kit ***"
     print " - Script by LukeZGD -"
+    print " - Fork by kaiden.cc -"
     echo
     version_get
 
